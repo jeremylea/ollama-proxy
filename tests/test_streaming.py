@@ -1,186 +1,202 @@
 """
 Tests for the streaming functionality.
 """
+
 import json
-from unittest.mock import MagicMock, patch
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
-@patch('app.main.litellm.acompletion') # Target acompletion
-def test_generate_streaming(mock_acompletion, test_client): # Rename mock arg
+def _make_sse_lines(contents, usage=None):
+    """Generate OpenAI-style SSE lines for a list of content chunks."""
+    lines = []
+    for content in contents:
+        data = {
+            "choices": [{
+                "delta": {"content": content, "role": "assistant"},
+            }],
+        }
+        lines.append(f"data: {json.dumps(data)}")
+    if usage:
+        lines.append(f"data: {json.dumps({'usage': usage})}")
+    lines.append("data: [DONE]")
+    return lines
+
+
+@patch("app.main.get_http_client")
+def test_generate_streaming(mock_get_client, test_client):
     """Test the generate endpoint with streaming."""
-    # Create a mock for the streaming response
-    class MockStreamingResponse:
-        def __aiter__(self):
-            return self
-        
-        async def __anext__(self):
-            # Simulate stream end after 3 chunks
-            if not hasattr(self, 'count'):
-                self.count = 0
-            
-            if self.count >= 3:
-                raise StopAsyncIteration
-            
-            chunk = MagicMock()
-            chunk.choices = [MagicMock()]
-            chunk.model = "ollama/llama3"
-            chunk.created = 1713000000
-            
-            # Simulate different chunks of content
-            contents = ["Hello", " world", "!"]
-            chunk.choices[0].delta.content = contents[self.count]
-            
-            self.count += 1
-            return chunk
-    
-    # Set up the mock to return our streaming response
-    mock_acompletion.return_value = MockStreamingResponse() # Use renamed mock arg
-    
-    # Make a request to generate endpoint with streaming
-    request_data = {
-        "model": "llama3",
+    mock_client = AsyncMock()
+
+    # Build mock streaming response
+    sse_lines = _make_sse_lines(["Hello", " world", "!"], usage={"prompt_tokens": 3, "completion_tokens": 3})
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    async def aiter_lines():
+        for line in sse_lines:
+            yield line
+
+    mock_response.aiter_lines = aiter_lines
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
         "prompt": "Say hello",
-        "stream": True
-    }
-    
-    # Use the test client to make a streaming request
-    response = test_client.post("/api/generate", json=request_data)
-    
-    # Check that the response is a streaming response
+        "stream": True,
+    })
+
     assert response.status_code == 200
-    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
-    
-    # Parse the streaming response
-    chunks = list(response.iter_lines())
-    assert len(chunks) >= 4  # 3 content chunks + 1 final done message
 
-    # Verify the content of each chunk
-    all_content = ""
-    final_chunk_data = None
-    intermediate_chunks = []
+    chunks = [line for line in response.iter_lines() if line.strip()]
+    # 3 content chunks + 1 final done chunk
+    assert len(chunks) >= 4
+
+    intermediate = []
+    final = None
     for chunk_str in chunks:
-        if not chunk_str:
-            continue # Skip potential empty lines
-
         data = json.loads(chunk_str)
-        if data.get("done") is True:
-            final_chunk_data = data
+        if data.get("done"):
+            final = data
         else:
-            intermediate_chunks.append(data)
-            assert "model" in data
-            assert "created_at" in data
-            assert "response" in data
-            assert "done" in data and data["done"] is False
-            all_content += data["response"]
+            intermediate.append(data)
 
-    # Check intermediate chunks
-    assert len(intermediate_chunks) == 3
-    assert intermediate_chunks[0]["response"] == "Hello"
-    assert intermediate_chunks[1]["response"] == " world"
-    assert intermediate_chunks[2]["response"] == "!"
+    assert len(intermediate) == 3
+    assert intermediate[0]["response"] == "Hello"
+    assert intermediate[1]["response"] == " world"
+    assert intermediate[2]["response"] == "!"
+    assert all(c["model"] == "gpt-4o" for c in intermediate)
 
-    # Check that we received the complete message
-    assert all_content == "Hello world!"
-
-    # Check the final chunk structure (as defined in stream_generate_generator)
-    assert final_chunk_data is not None
-    assert final_chunk_data["done"] is True
-    assert "model" in final_chunk_data
-    assert "created_at" in final_chunk_data
-    assert "response" in final_chunk_data and final_chunk_data["response"] == ""
-    assert "context" in final_chunk_data # Check for placeholder fields
-    assert "total_duration" in final_chunk_data
+    assert final is not None
+    assert final["done"] is True
+    assert final["done_reason"] == "stop"
+    assert final["prompt_eval_count"] == 3
+    assert final["eval_count"] == 3
 
 
-@patch('app.main.litellm.acompletion') # Target acompletion
-def test_chat_streaming(mock_acompletion, test_client): # Rename mock arg
+@patch("app.main.get_http_client")
+def test_chat_streaming(mock_get_client, test_client):
     """Test the chat endpoint with streaming."""
-    # Create a mock for the streaming response
-    class MockStreamingResponse:
-        def __aiter__(self):
-            return self
-        
-        async def __anext__(self):
-            # Simulate stream end after 3 chunks
-            if not hasattr(self, 'count'):
-                self.count = 0
-            
-            if self.count >= 3:
-                raise StopAsyncIteration
-            
-            chunk = MagicMock()
-            chunk.choices = [MagicMock()]
-            chunk.model = "ollama/llama3"
-            chunk.created = 1713000000
-            
-            # Simulate different chunks of content
-            contents = ["I'm ", "doing ", "well!"]
-            chunk.choices[0].delta.content = contents[self.count]
-            
-            self.count += 1
-            return chunk
-    
-    # Set up the mock to return our streaming response
-    mock_acompletion.return_value = MockStreamingResponse() # Use renamed mock arg
-    
-    # Make a request to chat endpoint with streaming
-    request_data = {
-        "model": "llama3",
-        "messages": [
-            {"role": "user", "content": "How are you?"}
-        ],
-        "stream": True
-    }
-    
-    # Use the test client to make a streaming request
-    response = test_client.post("/api/chat", json=request_data)
-    
-    # Check that the response is a streaming response
+    mock_client = AsyncMock()
+
+    sse_lines = _make_sse_lines(["I'm ", "doing ", "well!"], usage={"prompt_tokens": 4, "completion_tokens": 3})
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    async def aiter_lines():
+        for line in sse_lines:
+            yield line
+
+    mock_response.aiter_lines = aiter_lines
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/chat", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "How are you?"}],
+        "stream": True,
+    })
+
     assert response.status_code == 200
-    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
-    
-    # Parse the streaming response
-    chunks = list(response.iter_lines())
-    assert len(chunks) >= 4  # 3 content chunks + 1 final done message
 
-    # Verify the content of each chunk
-    all_content = ""
-    final_chunk_data = None
-    intermediate_chunks = []
+    chunks = [line for line in response.iter_lines() if line.strip()]
+    assert len(chunks) >= 4
+
+    intermediate = []
+    final = None
     for chunk_str in chunks:
-        if not chunk_str:
-            continue # Skip potential empty lines
-
         data = json.loads(chunk_str)
-        if data.get("done") is True:
-            final_chunk_data = data
+        if data.get("done"):
+            final = data
         else:
-            intermediate_chunks.append(data)
-            assert "model" in data
-            assert "created_at" in data
-            assert "message" in data # Chat uses 'message' key
-            assert "role" in data["message"]
-            assert "content" in data["message"]
-            assert data["message"]["role"] == "assistant"
-            assert "done" in data and data["done"] is False
-            all_content += data["message"]["content"]
+            intermediate.append(data)
 
-    # Check intermediate chunks
-    assert len(intermediate_chunks) == 3
-    assert intermediate_chunks[0]["message"]["content"] == "I'm "
-    assert intermediate_chunks[1]["message"]["content"] == "doing "
-    assert intermediate_chunks[2]["message"]["content"] == "well!"
+    assert len(intermediate) == 3
+    assert intermediate[0]["message"]["content"] == "I'm "
+    assert intermediate[1]["message"]["content"] == "doing "
+    assert intermediate[2]["message"]["content"] == "well!"
+    assert all(c["message"]["role"] == "assistant" for c in intermediate)
 
-    # Check that we received the complete message
-    assert all_content == "I'm doing well!"
+    assert final is not None
+    assert final["done"] is True
+    assert final["done_reason"] == "stop"
+    assert final["prompt_eval_count"] == 4
+    assert final["eval_count"] == 3
 
-    # Check the final chunk structure (as defined in stream_chat_generator)
-    assert final_chunk_data is not None
-    assert final_chunk_data["done"] is True
-    assert "model" in final_chunk_data
-    assert "created_at" in final_chunk_data
-    assert "message" in final_chunk_data
-    assert "role" in final_chunk_data["message"]
-    assert "content" in final_chunk_data["message"] and final_chunk_data["message"]["content"] == ""
-    assert "done_reason" in final_chunk_data # Check for placeholder fields
-    assert "total_duration" in final_chunk_data
+
+@patch("app.main.get_http_client")
+def test_generate_streaming_no_usage(mock_get_client, test_client):
+    """Test generate streaming when no usage data is provided."""
+    mock_client = AsyncMock()
+
+    sse_lines = _make_sse_lines(["Hello", "!"])
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    async def aiter_lines():
+        for line in sse_lines:
+            yield line
+
+    mock_response.aiter_lines = aiter_lines
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "Hi",
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    chunks = [line for line in response.iter_lines() if line.strip()]
+    final = None
+    for chunk_str in chunks:
+        data = json.loads(chunk_str)
+        if data.get("done"):
+            final = data
+    assert final is not None
+    assert final["done"] is True
+
+
+@patch("app.main.get_http_client")
+def test_chat_streaming_with_finish_reason(mock_get_client, test_client):
+    """Test chat streaming captures finish_reason from the last choice."""
+    mock_client = AsyncMock()
+
+    lines = []
+    chunk1 = json.dumps({"choices": [{"delta": {"content": "OK", "role": "assistant"}}]})
+    lines.append(f"data: {chunk1}")
+    chunk2 = json.dumps({"choices": [{"finish_reason": "length"}], "usage": {"prompt_tokens": 2, "completion_tokens": 1}})
+    lines.append(f"data: {chunk2}")
+    lines.append("data: [DONE]")
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    async def aiter_lines():
+        for line in lines:
+            yield line
+
+    mock_response.aiter_lines = aiter_lines
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/chat", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    chunks = [line for line in response.iter_lines() if line.strip()]
+    final = None
+    for chunk_str in chunks:
+        data = json.loads(chunk_str)
+        if data.get("done"):
+            final = data
+    assert final is not None
+    assert final["done_reason"] == "length"

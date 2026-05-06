@@ -1,42 +1,43 @@
 """
 Configuration for the Ollama API proxy.
+
+All settings are loaded from environment variables or a .env file.
 """
 
-# Model mapping from Ollama model names to LiteLLM model names
-MODEL_MAPPING = {
-    # Default mapping (prefix with 'ollama/')
-    "default": lambda model: f"ollama/{model}",
-    
-    # OpenAI model mappings
-    "gpt-3.5-turbo": "openai/gpt-3.5-turbo",
-    "gpt-4": "openai/gpt-4",
-    "gpt-4-turbo": "openai/gpt-4-turbo-preview",
-    
-    # Anthropic model mappings
-    "claude-3-opus": "anthropic/claude-3-opus-20240229",
-    "claude-3-sonnet": "anthropic/claude-3-sonnet-20240229",
-    "claude-3-haiku": "anthropic/claude-3-haiku-20240307",
-    "claude-3.5": "anthropic/claude-3.5-sonnet-20240620", # Added mapping for 3.5
-    "anthropic/claude-3.5": "anthropic/claude-3.5-sonnet-20240620", # Added mapping for namespaced 3.5
+import os
+from dotenv import load_dotenv
 
-    # Google model mappings
-    "gemini-pro": "google/gemini-pro",
-    "gemini-ultra": "google/gemini-1.5-pro",
-    
-    # Ollama native models (keep as is but with prefix)
-    "llama3": "ollama/llama3",
-    "mistral": "ollama/mistral",
-    "mixtral": "ollama/mixtral",
-    "phi": "ollama/phi",
-}
+load_dotenv()
 
-# Server configuration
-DEFAULT_PORT = 11434
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_LOG_LEVEL = "info"
 
-# LiteLLM configuration
-LITELLM_CONFIG = {
-    "verbose": False,
-    # Add any other LiteLLM configuration options here
-}
+class Settings:
+    """Application settings loaded from environment variables."""
+
+    # LiteLLM proxy configuration
+    LITELLM_BASE_URL: str = os.getenv("LITELLM_BASE_URL", "http://localhost:4000")
+    LITELLM_API_KEY: str = os.getenv("LITELLM_API_KEY", "")
+
+    # Server configuration
+    PORT: int = int(os.getenv("PORT", "11434"))
+    HOST: str = os.getenv("HOST", "0.0.0.0")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info").lower()
+
+    # Request timeout in seconds for calls to LiteLLM proxy
+    HTTP_TIMEOUT: float = float(os.getenv("HTTP_TIMEOUT", "300.0"))
+
+    # Proxy version string returned by /api/version
+    VERSION: str = "0.23.1"
+
+
+settings = Settings()
+
+
+def setup_logging() -> None:
+    """Configure application-wide logging."""
+    import logging
+
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )

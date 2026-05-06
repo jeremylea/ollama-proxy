@@ -1,578 +1,783 @@
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import litellm
+"""
+Ollama API Proxy Server
+
+Implements the Ollama API specification and routes all requests to a
+configurable LiteLLM proxy server via HTTP.
+"""
+
+import hashlib
 import json
+import time
 import logging
-from typing import List, Dict
-from datetime import datetime # Import datetime
-import uvicorn
-from dotenv import load_dotenv
-from app.config import MODEL_MAPPING, LITELLM_CONFIG
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Dict, Any, List, Optional, Union
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from app.config import settings, setup_logging
 from app.models import (
-    GenerateRequest, GenerateResponse, ChatMessage, ChatRequest, ChatResponse,
-    ModelInfo, ListTagsResponse, ModelDetails, EmbeddingRequest, EmbeddingResponse, # Added ListTagsResponse
-    ShowModelResponse, ShowModelRequest, PsResponse, CreateModelRequest, # Added VersionResponse and CreateModelRequest
-    CopyModelRequest, DeleteModelRequest, PullModelRequest, PushModelRequest # Added stub request models
+    GenerateRequest,
+    GenerateResponse,
+    ChatRequest,
+    ChatMessage,
+    ChatResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    ShowModelRequest,
+    ShowModelResponse,
+    ListTagsResponse,
+    ModelInfo,
+    ModelDetails,
+    PsResponse,
+    VersionResponse,
+    CreateModelRequest,
+    CopyModelRequest,
+    DeleteModelRequest,
+    PullModelRequest,
+    PushModelRequest,
 )
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
+# ── Global HTTP client (lazy-initialized) ───────────────────────────────────
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Return a shared async HTTP client for LiteLLM proxy calls."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if settings.LITELLM_API_KEY:
+            headers["Authorization"] = f"Bearer {settings.LITELLM_API_KEY}"
+        _http_client = httpx.AsyncClient(
+            base_url=settings.LITELLM_BASE_URL,
+            headers=headers,
+            timeout=httpx.Timeout(settings.HTTP_TIMEOUT, connect=10.0),
+        )
+    return _http_client
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    setup_logging()
+    logger.info("Starting Ollama API proxy")
+    logger.info("LiteLLM base URL: %s", settings.LITELLM_BASE_URL)
+    yield
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        logger.info("HTTP client closed")
+
+
+# ── FastAPI Application ─────────────────────────────────────────────────────
+
 app = FastAPI(
-    title="Ollama API Compatibility Layer",
-    description="A drop-in replacement for Ollama API using LiteLLM",
-    version="0.1.0",
+    title="Ollama API Proxy",
+    description="Ollama-compatible proxy routing to a LiteLLM backend",
+    version=settings.VERSION,
+    lifespan=lifespan,
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure LiteLLM
-def configure_litellm():
-    # You can add your API keys directly or via environment variables
-    # LiteLLM will pick up environment variables like OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
-    
-    # Set verbosity level
-    litellm.verbose = LITELLM_CONFIG.get("verbose", False)
-    
-    # Apply any other configuration from LITELLM_CONFIG
-    for key, value in LITELLM_CONFIG.items():
-        if key != "verbose":  # Already handled above
-            if hasattr(litellm, f"set_{key}"):
-                getattr(litellm, f"set_{key}")(value)
-            else:
-                logger.warning(f"Unknown LiteLLM configuration option: {key}")
 
-configure_litellm()
+# ── Request Transformation Helpers ──────────────────────────────────────────
 
-# Helper functions defined above
+def map_options_to_openai(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Map Ollama-style options to OpenAI-compatible parameters.
 
-# Helper functions
-def map_to_litellm_model(model_name: str) -> str:
+    Ollama options use keys like ``num_ctx`` and ``repeat_penalty``.
+    OpenAI uses ``max_tokens``, ``frequency_penalty``, etc.
+    We pass through the common keys and translate the well-known ones.
     """
-    Map Ollama model names to LiteLLM compatible model names.
-    If the name contains '/', pass it directly.
-    Otherwise, check for convenience mappings or apply the default 'ollama/' prefix.
+    if not options:
+        return {}
+
+    param_map = {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "max_tokens": "max_tokens",
+        "num_predict": "max_tokens",
+        "num_ctx": "max_tokens",
+        "repeat_penalty": "frequency_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "presence_penalty": "presence_penalty",
+        "seed": "seed",
+        "stop": "stop",
+    }
+
+    result: Dict[str, Any] = {}
+    for ollama_key, openai_key in param_map.items():
+        if ollama_key in options:
+            result[openai_key] = options[ollama_key]
+
+    # Pass through any extra options that might be understood by LiteLLM
+    for key, value in options.items():
+        if key not in param_map:
+            result[key] = value
+
+    return result
+
+
+def build_openai_messages_generate(
+    prompt: str, system: Optional[str]
+) -> List[Dict[str, str]]:
+    """Build OpenAI messages array for a generate request."""
+    messages: List[Dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def build_openai_messages_chat(
+    messages: List[ChatMessage],
+) -> List[Dict[str, Any]]:
+    """Build OpenAI messages array from Ollama chat messages."""
+    result: List[Dict[str, Any]] = []
+    for msg in messages:
+        entry: Dict[str, Any] = {"role": msg.role, "content": msg.content}
+        if msg.tool_calls:
+            entry["tool_calls"] = msg.tool_calls
+        result.append(entry)
+    return result
+
+
+def build_openai_format(format_val: Optional[Union[str, Dict[str, Any]]]) -> Optional[Any]:
+    """Convert Ollama format parameter to OpenAI response_format."""
+    if format_val is None:
+        return None
+    if isinstance(format_val, str) and format_val == "json":
+        return {"type": "json_object"}
+    if isinstance(format_val, dict):
+        return {"type": "json_schema", "json_schema": format_val}
+    return None
+
+
+# ── Response Transformation Helpers ─────────────────────────────────────────
+
+def now_iso() -> str:
+    """Return current UTC time in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def extract_usage_nanos(usage: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+    """Extract timing/count fields from an OpenAI usage object.
+
+    Returns nanosecond-based durations (best-effort estimates).
     """
-    # If the model name already contains a '/', assume it's a direct LiteLLM model string
-    if "/" in model_name:
-        logger.info(f"Using model name directly: {model_name}")
-        return model_name
+    if not usage:
+        return {
+            "prompt_eval_count": None,
+            "eval_count": None,
+            "prompt_eval_duration": None,
+            "eval_duration": None,
+            "total_duration": None,
+            "load_duration": None,
+        }
 
-    # If no '/', check for an exact convenience mapping (excluding the default lambda)
-    if model_name in MODEL_MAPPING and not callable(MODEL_MAPPING[model_name]):
-        mapped_name = MODEL_MAPPING[model_name]
-        logger.info(f"Mapped convenience model '{model_name}' to '{mapped_name}'")
-        return mapped_name
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
 
-    # If no '/' and no specific mapping, assume it's a direct Ollama model name.
-    # Do NOT apply the 'ollama/' prefix here, let LiteLLM handle it based on its provider detection.
-    logger.info(f"No specific mapping found for '{model_name}'. Using it directly for LiteLLM.")
-    return model_name
+    return {
+        "prompt_eval_count": prompt_tokens,
+        "eval_count": completion_tokens,
+        # OpenAI doesn't expose per-phase durations, so we leave these as None
+        "prompt_eval_duration": None,
+        "eval_duration": None,
+        "total_duration": None,
+        "load_duration": None,
+    }
 
-def convert_chat_to_litellm_format(messages: List[ChatMessage]) -> List[Dict[str, str]]:
-    """Convert Ollama chat messages to LiteLLM format."""
-    return [{"role": msg.role, "content": msg.content} for msg in messages]
 
-async def stream_generate_generator(stream):
-    """Generate streaming responses for /api/generate in Ollama format."""
-    final_model = None
-    final_created_at = None
-    async for chunk in stream:
-        if hasattr(chunk, "choices") and len(chunk.choices) > 0:
-            choice = chunk.choices[0]
-            final_model = chunk.model # Store model for final chunk
-            final_created_at = datetime.fromtimestamp(chunk.created).isoformat() + "Z" # Store and format timestamp
+def transform_chat_message(message: Dict[str, Any]) -> ChatMessage:
+    """Transform an OpenAI message object to an Ollama ChatMessage."""
+    return ChatMessage(
+        role=message.get("role", "assistant"),
+        content=message.get("content", ""),
+        tool_calls=message.get("tool_calls"),
+    )
 
-            if hasattr(choice, "delta") and hasattr(choice.delta, "content"):
-                content = choice.delta.content
-                if content:
-                    # Format intermediate chunk for /api/generate
-                    yield json.dumps({
-                        "model": final_model,
-                        "created_at": final_created_at,
-                        "response": content,
-                        "done": False
-                    }) + "\n"
 
-    # Final message indicating completion for /api/generate
-    # Mimics Ollama's final streaming chunk structure
-    if final_model and final_created_at:
-        yield json.dumps({
-            "model": final_model,
-            "created_at": final_created_at,
-            "response": "", # Empty response in final chunk
-            "done": True,
-            # Add other fields if available from LiteLLM usage info later
-            "context": [], # Placeholder
-            "total_duration": 0, # Placeholder
-            "load_duration": 0, # Placeholder
-            "prompt_eval_count": 0, # Placeholder
-            "prompt_eval_duration": 0, # Placeholder
-            "eval_count": 0, # Placeholder
-            "eval_duration": 0 # Placeholder
-        }) + "\n"
+# ── Streaming Helpers ───────────────────────────────────────────────────────
+
+async def stream_generate_transform(
+    http_client: httpx.AsyncClient,
+    response: httpx.Response,
+    model: str,
+) -> AsyncGenerator[str]:
+    """Transform OpenAI SSE stream into Ollama generate SSE format."""
+    created_at = now_iso()
+    start_time = time.monotonic()
+    prompt_tokens = 0
+    completion_tokens = 0
+    final_usage: Optional[Dict[str, Any]] = None
+
+    async for line in response.aiter_lines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            # Emit final chunk
+            elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+            chunk = {
+                "model": model,
+                "created_at": created_at,
+                "response": "",
+                "done": True,
+                "done_reason": "stop",
+                "total_duration": elapsed_ns,
+                "load_duration": 0,
+                "prompt_eval_count": prompt_tokens,
+                "eval_count": completion_tokens,
+            }
+            if final_usage:
+                usage_tokens = final_usage.get("prompt_tokens")
+                if usage_tokens:
+                    chunk["prompt_eval_count"] = usage_tokens
+                comp_tokens = final_usage.get("completion_tokens")
+                if comp_tokens:
+                    chunk["eval_count"] = comp_tokens
+            yield json.dumps(chunk) + "\n"
+            return
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        # Capture usage from the final data chunk
+        if "usage" in data:
+            final_usage = data["usage"]
+            prompt_tokens = data["usage"].get("prompt_tokens", 0)
+            completion_tokens = data["usage"].get("completion_tokens", 0)
+
+        choices = data.get("choices")
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        content = delta.get("content")
+        if content:
+            completion_tokens += len(content.split())
+            yield json.dumps({
+                "model": model,
+                "created_at": created_at,
+                "response": content,
+                "done": False,
+            }) + "\n"
+
+    # Fallback final chunk if [DONE] was not received
+    elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+    yield json.dumps({
+        "model": model,
+        "created_at": created_at,
+        "response": "",
+        "done": True,
+        "done_reason": "stop",
+        "total_duration": elapsed_ns,
+        "load_duration": 0,
+        "prompt_eval_count": prompt_tokens,
+        "eval_count": completion_tokens,
+    }) + "\n"
+
+
+async def stream_chat_transform(
+    http_client: httpx.AsyncClient,
+    response: httpx.Response,
+    model: str,
+) -> AsyncGenerator[str]:
+    """Transform OpenAI SSE stream into Ollama chat SSE format."""
+    created_at = now_iso()
+    start_time = time.monotonic()
+    prompt_tokens = 0
+    completion_tokens = 0
+    final_usage: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
+
+    async for line in response.aiter_lines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            # Emit final chunk
+            elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+            chunk: Dict[str, Any] = {
+                "model": model,
+                "created_at": created_at,
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": finish_reason or "stop",
+                "total_duration": elapsed_ns,
+                "load_duration": 0,
+                "prompt_eval_count": prompt_tokens,
+                "eval_count": completion_tokens,
+            }
+            if final_usage:
+                usage_tokens = final_usage.get("prompt_tokens")
+                if usage_tokens:
+                    chunk["prompt_eval_count"] = usage_tokens
+                comp_tokens = final_usage.get("completion_tokens")
+                if comp_tokens:
+                    chunk["eval_count"] = comp_tokens
+            yield json.dumps(chunk) + "\n"
+            return
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        # Capture usage
+        if "usage" in data:
+            final_usage = data["usage"]
+            prompt_tokens = data["usage"].get("prompt_tokens", 0)
+            completion_tokens = data["usage"].get("completion_tokens", 0)
+
+        # Capture finish_reason
+        choices = data.get("choices")
+        if choices and choices[0].get("finish_reason"):
+            finish_reason = choices[0]["finish_reason"]
+
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        content = delta.get("content", "")
+        role = delta.get("role", "assistant")
+        tool_calls = delta.get("tool_calls")
+
+        message: Dict[str, Any] = {"role": role, "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        if content or tool_calls:
+            completion_tokens += len(content.split())
+            yield json.dumps({
+                "model": model,
+                "created_at": created_at,
+                "message": message,
+                "done": False,
+            }) + "\n"
+
+    # Fallback final chunk
+    elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+    yield json.dumps({
+        "model": model,
+        "created_at": created_at,
+        "message": {"role": "assistant", "content": ""},
+        "done": True,
+        "done_reason": finish_reason or "stop",
+        "total_duration": elapsed_ns,
+        "load_duration": 0,
+        "prompt_eval_count": prompt_tokens,
+        "eval_count": completion_tokens,
+    }) + "\n"
+
+
+# ── LiteLLM /v1/models -> Ollama /api/tags transformation ──────────────────
+
+def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
+    """Transform LiteLLM /v1/models response to Ollama /api/tags format."""
+    models: List[ModelInfo] = []
+    for m in data.get("data", []):
+        id_ = m.get("id", "")
+        # Build a deterministic digest from the model id
+        digest = "sha256:" + hashlib.sha256(id_.encode()).hexdigest()
+
+        # Infer family from model name
+        name_lower = id_.lower()
+        if "gpt" in name_lower:
+            family = "gpt"
+        elif "claude" in name_lower:
+            family = "claude"
+        elif "gemini" in name_lower:
+            family = "gemini"
+        elif "llama" in name_lower:
+            family = "llama"
+        elif "mistral" in name_lower:
+            family = "mistral"
+        else:
+            family = "unknown"
+
+        model_info = ModelInfo(
+            name=id_,
+            modified_at=datetime.fromtimestamp(
+                m.get("created", 0), tz=timezone.utc
+            ).isoformat(),
+            size=m.get("size", 0) or 0,
+            digest=digest,
+            details=ModelDetails(
+                format=m.get("object", "model"),
+                family=family,
+                families=[family],
+                parameter_size=m.get("parameter_size"),
+                quantization_level=m.get("quantization_level"),
+            ),
+        )
+        models.append(model_info)
+    return ListTagsResponse(models=models)
+
+
+# ── Error Handling Helper ───────────────────────────────────────────────────
+
+async def handle_litellm_error(response: httpx.Response) -> None:
+    """Raise an HTTPException based on a LiteLLM error response."""
+    status_code = response.status_code
+    try:
+        error_data = response.json()
+    except Exception:
+        error_data = {}
+
+    detail = error_data.get("error", {})
+    if isinstance(detail, dict):
+        message = detail.get("message", response.text)
     else:
-         # Fallback if stream was empty or malformed
-         yield json.dumps({"done": True}) + "\n"
+        message = str(detail) or response.text
+
+    logger.error("LiteLLM error %d: %s", status_code, message)
+    raise HTTPException(status_code=status_code, detail=message)
 
 
-async def stream_chat_generator(stream):
-    """Generate streaming responses for /api/chat in Ollama format."""
-    final_model = None
-    final_created_at = None
-    async for chunk in stream:
-        if hasattr(chunk, "choices") and len(chunk.choices) > 0:
-            choice = chunk.choices[0]
-            final_model = chunk.model # Store model for final chunk
-            final_created_at = datetime.fromtimestamp(chunk.created).isoformat() + "Z" # Store and format timestamp
+# ── API Endpoints ───────────────────────────────────────────────────────────
 
-            if hasattr(choice, "delta") and hasattr(choice.delta, "content"):
-                content = choice.delta.content
-                if content:
-                    # Format intermediate chunk for /api/chat
-                    yield json.dumps({
-                        "model": final_model,
-                        "created_at": final_created_at,
-                        "message": {
-                            "role": "assistant", # Assuming assistant role for delta content
-                            "content": content
-                        },
-                        "done": False
-                    }) + "\n"
-
-    # Final message indicating completion for /api/chat
-    # Mimics Ollama's final streaming chunk structure
-    if final_model and final_created_at:
-        yield json.dumps({
-            "model": final_model,
-            "created_at": final_created_at,
-            "message": { # Empty message content in final chunk
-                "role": "assistant",
-                "content": ""
-            },
-            "done": True,
-            "done_reason": "stop", # Default reason
-            # Add other fields if available from LiteLLM usage info later
-            "total_duration": 0, # Placeholder
-            "load_duration": 0, # Placeholder
-            "prompt_eval_count": 0, # Placeholder
-            "prompt_eval_duration": 0, # Placeholder
-            "eval_count": 0, # Placeholder
-            "eval_duration": 0 # Placeholder
-        }) + "\n"
-    else:
-        # Fallback if stream was empty or malformed
-        yield json.dumps({"done": True}) + "\n"
-
-
-# API Routes
 @app.get("/")
-async def root_get():
-    """Handle GET requests to the root path."""
-    return {"message": "Ollama API compatibility layer using LiteLLM"}
+async def root():
+    """Health check endpoint."""
+    return {"message": "Ollama API proxy"}
+
 
 @app.head("/")
 async def root_head():
-    """Handle HEAD requests to the root path for health checks."""
-    return Response(status_code=200)
+    """HEAD health check."""
+    return JSONResponse(status_code=200, content={})
 
-@app.post("/api/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest):
-    """Generate completions (Ollama's /api/generate endpoint)"""
+
+@app.get("/api/version", response_model=VersionResponse)
+async def version():
+    """Return the Ollama version."""
+    return VersionResponse(version=settings.VERSION)
+
+
+@app.get("/api/tags", response_model=ListTagsResponse)
+async def list_tags():
+    """List available models by fetching from LiteLLM /v1/models."""
+    client = await get_http_client()
     try:
-        model = map_to_litellm_model(request.model)
-        logger.info(f"Generating completion with model: {model}")
-
-        # Handle Ollama's model loading behavior when prompt is empty
-        if not request.prompt:
-            logger.info(f"Empty prompt received for model {request.model}. Treating as load request.")
-            # Simulate model load response based on Ollama spec
-            created_time = datetime.now().isoformat() + "Z"
-            return GenerateResponse(
-                model=request.model,
-                created_at=created_time,
-                response="",
-                done=True,
-                done_reason="load" # Indicate it was a load operation
+        response = await client.get("/v1/models")
+        if response.status_code == 200:
+            data = response.json()
+            return transform_litellm_models(data)
+        # Surface client errors (4xx) to the caller; gracefully fallback on 5xx
+        if 400 <= response.status_code < 500:
+            logger.error("LiteLLM models endpoint returned %d", response.status_code)
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"LiteLLM models endpoint returned {response.status_code}",
             )
-
-        messages = [{"role": "system", "content": request.system}] if request.system else []
-        messages.append({"role": "user", "content": request.prompt})
-
-        # Set parameters based on request options
-        params = {}
-        if request.options:
-            # Map Ollama options to LiteLLM parameters (expand as needed)
-            if "temperature" in request.options:
-                params["temperature"] = request.options["temperature"]
-            if "top_p" in request.options:
-                params["top_p"] = request.options["top_p"]
-            if "max_tokens" in request.options:
-                params["max_tokens"] = request.options["max_tokens"]
-        
-        # Handle streaming
-        if request.stream:
-            stream = await litellm.acompletion( # Use acompletion
-                model=model,
-                messages=messages,
-                stream=True,
-                **params
-            )
-            return StreamingResponse(
-                stream_generate_generator(stream), # Use the generate-specific generator
-                media_type="text/event-stream"
-            )
-        # Non-streaming response
-        response = await litellm.acompletion( # Use acompletion
-            model=model,
-            messages=messages,
-            **params
+        logger.warning("Failed to fetch models from LiteLLM: %d", response.status_code)
+        return ListTagsResponse(models=[])
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail="Backend proxy unavailable",
         )
-        
-        # Get response content
-        content = response.choices[0].message.content
-        
-        # Map response to Ollama format
-        created_time = datetime.fromtimestamp(response.created).isoformat() + "Z"
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(
+            status_code=504,
+            detail="Backend proxy timeout",
+        )
+
+
+@app.post("/api/generate")
+async def generate(request: GenerateRequest):
+    """Generate a completion (Ollama /api/generate endpoint).
+
+    Transforms the request to OpenAI chat completions format and routes
+    to the LiteLLM proxy.
+    """
+    logger.info("Generate request: model=%s, stream=%s", request.model, request.stream)
+
+    # Handle empty prompt (model load check)
+    if not request.prompt:
+        logger.info("Empty prompt for model %s – returning load response", request.model)
         return GenerateResponse(
             model=request.model,
-            created_at=created_time, # Format timestamp
-            response=content,
+            created_at=now_iso(),
+            response="",
             done=True,
-            context=[],  # Ollama returns context here, but we don't have an equivalent
-            total_duration=0,  # Would need to measure this
-            load_duration=0,
-            prompt_eval_count=0,
-            prompt_eval_duration=0,
-            eval_count=len(content.split()),
-            eval_duration=0
+            done_reason="load",
         )
-        
-    except Exception as e:
-        logger.error(f"Error in generate: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Chat completions (Ollama's /api/chat endpoint)"""
+    client = await get_http_client()
+    messages = build_openai_messages_generate(request.prompt, request.system)
+    openai_params = map_options_to_openai(request.options)
+    fmt = build_openai_format(request.format)
+
+    body: Dict[str, Any] = {
+        "model": request.model,
+        "messages": messages,
+        **openai_params,
+    }
+    if fmt:
+        body["response_format"] = fmt
+
     try:
-        model = map_to_litellm_model(request.model)
-        logger.info(f"Generating chat completion with model: {model}")
-        logger.info(f"Chat request stream parameter: {request.stream}") # Add logging
-
-        # Handle Ollama's model loading behavior when messages list is empty
-        if not request.messages:
-            logger.info(f"Empty messages list received for model {request.model}. Treating as load request.")
-            # Simulate model load response based on Ollama spec
-            created_time = datetime.now().isoformat() + "Z"
-            return ChatResponse(
-                model=request.model,
-                created_at=created_time,
-                message=ChatMessage(role="assistant", content=""), # Empty assistant message
-                done=True,
-                done_reason="load" # Indicate it was a load operation
-            )
-
-        messages = convert_chat_to_litellm_format(request.messages)
-
-        # Set parameters based on request options
-        params = {}
-        if request.options:
-            if "temperature" in request.options:
-                params["temperature"] = request.options["temperature"]
-            if "top_p" in request.options:
-                params["top_p"] = request.options["top_p"]
-            if "max_tokens" in request.options:
-                params["max_tokens"] = request.options["max_tokens"]
-        
-        # Handle streaming
         if request.stream:
-            stream = await litellm.acompletion( # Use acompletion
-                model=model,
-                messages=messages,
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
                 stream=True,
-                **params
             )
+            if response.status_code != 200:
+                await handle_litellm_error(response)
+                return  # silence type checker
             return StreamingResponse(
-                stream_chat_generator(stream), # Use the chat-specific generator
-                media_type="text/event-stream"
+                stream_generate_transform(client, response, request.model),
+                media_type="text/event-stream",
             )
-        # Non-streaming response
-        response = await litellm.acompletion( # Use acompletion
-            model=model,
-            messages=messages,
-            **params
-        )
-        
-        # Get response content
-        content = response.choices[0].message.content
-        
-        # Map response to Ollama format
-        created_time = datetime.fromtimestamp(response.created).isoformat() + "Z"
+        else:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+            )
+            if response.status_code != 200:
+                await handle_litellm_error(response)
+                return
+            data = response.json()
+            usage_info = extract_usage_nanos(data.get("usage"))
+            choice = data["choices"][0]
+            content = choice["message"].get("content", "")
+            return GenerateResponse(
+                model=request.model,
+                created_at=now_iso(),
+                response=content,
+                done=True,
+                done_reason=choice.get("finish_reason"),
+                **usage_info,
+            )
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=502, detail="Backend proxy unavailable")
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=504, detail="Backend proxy timeout")
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest):
+    """Chat completion (Ollama /api/chat endpoint).
+
+    Transforms the request to OpenAI chat completions format and routes
+    to the LiteLLM proxy.
+    """
+    logger.info("Chat request: model=%s, stream=%s, messages=%d",
+                 request.model, request.stream, len(request.messages))
+
+    # Handle empty messages (model load check)
+    if not request.messages:
+        logger.info("Empty messages for model %s – returning load response", request.model)
         return ChatResponse(
             model=request.model,
-            created_at=created_time, # Format timestamp
-            message=ChatMessage(
-                role="assistant",
-                content=content
-            ),
+            created_at=now_iso(),
+            message=ChatMessage(role="assistant", content=""),
             done=True,
-            total_duration=0,
-            load_duration=0,
-            prompt_eval_count=0,
-            prompt_eval_duration=0,
-            eval_count=len(content.split()),
-            eval_duration=0
+            done_reason="load",
         )
-        
-    except Exception as e:
-        logger.error(f"Error in chat: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/models", response_model=ListTagsResponse) # Renamed from ListModelsResponse
-async def list_models():
-    """List available models (mimicking Ollama's /api/models endpoint)"""
-    # Note: Ollama spec uses /api/tags for this. We might want to align later.
+    client = await get_http_client()
+    messages = build_openai_messages_chat(request.messages)
+    openai_params = map_options_to_openai(request.options)
+    fmt = build_openai_format(request.format)
+
+    body: Dict[str, Any] = {
+        "model": request.model,
+        "messages": messages,
+        **openai_params,
+    }
+    if fmt:
+        body["response_format"] = fmt
+    if request.tools:
+        body["tools"] = request.tools
+
     try:
-        # In a real implementation, you'd return available models from LiteLLM
-        # For now, we'll return a placeholder response with sample models
-        return ListTagsResponse( # Renamed from ListModelsResponse
-            models=[
-                ModelInfo(
-                    name="llama3",
-                    modified_at="2023-11-04T14:56:49Z",
-                    size=3791730276,
-                    digest="sha256:b315144c8e8d286e96e2c38232d1ba5158726c9292419a4371a4531d5b36d2e2",
-                    details=ModelDetails(
-                        format="gguf",
-                        family="llama",
-                        families=["llama"],
-                        parameter_size="8B",
-                        quantization_level="Q5_K_M"
-                    )
-                ),
-                ModelInfo(
-                    name="mistral",
-                    modified_at="2023-11-03T10:23:15Z",
-                    size=4928473102,
-                    digest="sha256:a892f82058797e288135da32238bee3a2ff7cbc01d3d31da83091e6bcd8467c7",
-                    details=ModelDetails(
-                        format="gguf",
-                        family="mistral",
-                        families=["mistral"],
-                        parameter_size="7B",
-                        quantization_level="Q4_K_M"
-                    )
-                ),
-                ModelInfo(
-                    name="claude-3-haiku",
-                    modified_at="2024-03-15T08:45:30Z",
-                    size=0,  # Virtual model, no size
-                    digest="sha256:virtual",
-                    details=ModelDetails(
-                        format="api",
-                        family="claude",
-                        families=["claude"],
-                        parameter_size="unknown",
-                        quantization_level="none"
-                    )
-                )
-            ]
-        )
-    except Exception as e:
-        logger.error(f"Error listing models: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Additional Ollama endpoints (to be implemented)
-@app.get("/api/version")
-async def version():
-    """Return version information"""
-    return {"version": "0.1.0", "build": "ollama-litellm-proxy"}
-
-@app.get("/api/tags")
-async def tags():
-    """List available model tags"""
-    # Placeholder - implement as needed
-    return {"models": []}
-
-# Embeddings endpoint (Ollama spec uses /api/embed)
-@app.post("/api/embed", response_model=EmbeddingResponse) # Changed path
-async def generate_embeddings(request: EmbeddingRequest):
-    """Generate embeddings for text (Ollama's /api/embed endpoint)"""
-    try:
-        # Map the model name to LiteLLM format
-        litellm_model = map_to_litellm_model(request.model)
-        logger.info(f"Generating embeddings with model: {litellm_model}")
-
-        # Prepare input for LiteLLM (always expects a list)
-        input_list = [request.input] if isinstance(request.input, str) else request.input
-
-        # Generate embeddings using LiteLLM
-        response = litellm.embedding(
-            model=litellm_model,
-            input=input_list, # Use input_list
-            # Pass other options if needed: request.options, request.truncate, request.keep_alive
-        )
-
-        # Extract embeddings from the response
-        embeddings_list = [item.embedding for item in response.data]
-
-        # Format response in Ollama format
-        return EmbeddingResponse(
-            model=request.model, # Return original model name requested
-            embeddings=embeddings_list, # Use correct field name
-            # Populate duration/count fields if available from response.usage
-            prompt_eval_count=response.usage.prompt_tokens if hasattr(response, 'usage') else None,
-            # total_duration and load_duration are harder to get accurately here
-        )
-    except Exception as e:
-        logger.error(f"Error generating embeddings: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Show model information (Ollama spec uses POST)
-@app.post("/api/show", response_model=ShowModelResponse) # Changed method to POST
-async def show_model(request: ShowModelRequest): # Changed signature to use request body
-    """Show model information (Ollama's POST /api/show endpoint)"""
-    try:
-        # Map the model name to LiteLLM format
-        litellm_model = map_to_litellm_model(request.model) # Get model from request body
-        logger.info(f"Showing information for model: {litellm_model} (verbose={request.verbose})")
-
-        # Get the model family (assuming format is "family:version")
-        family = request.model.split(":")[0] if ":" in request.model else request.model
-
-        # Return placeholder model information
-        # In a real implementation, we would get this from LiteLLM or other source
-        # The 'verbose' parameter should ideally return more detailed info if True
-        return ShowModelResponse(
-            license="MIT",
-            modelfile=f"FROM {request.model}\n", # Use request.model here
-            parameters="default parameters",
-            template="{{ .Prompt }}",
-            details=ModelDetails(
-                format="gguf",
-                family=family,
-                families=[family],
-                parameter_size="Unknown",
-                quantization_level="Unknown"
+        if request.stream:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+                stream=True,
             )
-        )
-    except Exception as e:
-        logger.error(f"Error showing model information: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+            if response.status_code != 200:
+                await handle_litellm_error(response)
+                return
+            return StreamingResponse(
+                stream_chat_transform(client, response, request.model),
+                media_type="text/event-stream",
+            )
+        else:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=body,
+            )
+            if response.status_code != 200:
+                await handle_litellm_error(response)
+                return
+            data = response.json()
+            usage_info = extract_usage_nanos(data.get("usage"))
+            choice = data["choices"][0]
+            msg = transform_chat_message(choice["message"])
+            return ChatResponse(
+                model=request.model,
+                created_at=now_iso(),
+                message=msg,
+                done=True,
+                done_reason=choice.get("finish_reason"),
+                **usage_info,
+            )
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=502, detail="Backend proxy unavailable")
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=504, detail="Backend proxy timeout")
 
-# Status endpoint (Ollama spec uses /api/ps)
-@app.get("/api/ps", response_model=PsResponse) # Changed path and response model
-async def ps(): # Renamed function
-    """List running models (Ollama's /api/ps endpoint)"""
+
+@app.post("/api/embed", response_model=EmbeddingResponse)
+async def embed(request: EmbeddingRequest):
+    """Generate embeddings (Ollama /api/embed endpoint)."""
+    logger.info("Embed request: model=%s", request.model)
+
+    client = await get_http_client()
+    input_list: List[str] = (
+        [request.input] if isinstance(request.input, str) else request.input
+    )
+
+    body: Dict[str, Any] = {
+        "model": request.model,
+        "input": input_list,
+    }
+    if request.truncate is not None:
+        body["truncate"] = request.truncate
+
     try:
-        # In a real implementation, we would get this from LiteLLM or manage state
-        # Returning an empty list for now
-        return PsResponse(
-            models=[]
+        response = await client.post("/v1/embeddings", json=body)
+        if response.status_code != 200:
+            await handle_litellm_error(response)
+            return EmbeddingResponse(model=request.model, embeddings=[])
+        data = response.json()
+        embeddings = [item["embedding"] for item in data.get("data", [])]
+        usage_info = extract_usage_nanos(data.get("usage"))
+        return EmbeddingResponse(
+            model=request.model,
+            embeddings=embeddings,
+            prompt_eval_count=usage_info.get("prompt_eval_count"),
         )
-    except Exception as e:
-        logger.error(f"Error getting running models: {str(e)}") # Updated log message
-        raise HTTPException(status_code=500, detail=str(e))
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=502, detail="Backend proxy unavailable")
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=504, detail="Backend proxy timeout")
 
-# ----- Model Management Endpoints (Stubs) -----
 
-# Create model stub
+@app.post("/api/show", response_model=ShowModelResponse)
+async def show(request: ShowModelRequest):
+    """Show model information (best-effort stub)."""
+    logger.info("Show request: model=%s", request.model)
+    # We don't have detailed model metadata from LiteLLM, so return a minimal response
+    name = request.model.split(":")[0] if ":" in request.model else request.model
+    return ShowModelResponse(
+        modelfile=f"FROM {request.model}\n",
+        parameters="",
+        template="",
+        license="",
+        details=ModelDetails(
+            format="api",
+            family=name,
+            families=[name],
+        ),
+        capabilities=["completion"],
+    )
+
+
+@app.get("/api/ps", response_model=PsResponse)
+async def ps():
+    """List running models.
+
+    Returns empty list since we don't manage local model loading.
+    """
+    return PsResponse(models=[])
+
+
+# ── Unsupported Endpoints (501 Not Implemented) ─────────────────────────────
+
 @app.post("/api/create")
-async def create_model(request_data: CreateModelRequest): # Changed signature to use Pydantic model
-    """Create a model from a Modelfile"""
-    try:
-        # This functionality is Ollama-specific and not supported by LiteLLM
-        # We don't need to use request_data, just acknowledge it for routing.
-        error_message = "Creating models from Modelfiles is not supported in this proxy implementation"
-        logger.warning(error_message)
-        # Return 501 Not Implemented with informative message
-        raise HTTPException(status_code=501, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in create model endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def create_model(request: CreateModelRequest):
+    """Create a model – not supported."""
+    logger.warning("POST /api/create is not supported")
+    raise HTTPException(
+        status_code=501,
+        detail="Creating models is not supported in this proxy implementation",
+    )
 
-# Copy model stub
+
 @app.post("/api/copy")
-async def copy_model(request_data: CopyModelRequest): # Use specific model
-    """Copy a model"""
-    try:
-        # This functionality is Ollama-specific and not supported by LiteLLM
-        error_message = "Copying models is not supported in this proxy implementation"
-        logger.warning(error_message)
-        # Return 501 Not Implemented with informative message
-        raise HTTPException(status_code=501, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in copy model endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def copy_model(request: CopyModelRequest):
+    """Copy a model – not supported."""
+    logger.warning("POST /api/copy is not supported")
+    raise HTTPException(
+        status_code=501,
+        detail="Copying models is not supported in this proxy implementation",
+    )
 
-# Delete model stub
+
 @app.delete("/api/delete")
-async def delete_model(request_data: DeleteModelRequest): # Use specific model
-    """Delete a model"""
-    try:
-        # This functionality is Ollama-specific and not supported by LiteLLM
-        error_message = "Deleting models is not supported in this proxy implementation"
-        logger.warning(error_message)
-        # Return 501 Not Implemented with informative message
-        raise HTTPException(status_code=501, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in delete model endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def delete_model(request: DeleteModelRequest):
+    """Delete a model – not supported."""
+    logger.warning("DELETE /api/delete is not supported")
+    raise HTTPException(
+        status_code=501,
+        detail="Deleting models is not supported in this proxy implementation",
+    )
 
-# Pull model stub
+
 @app.post("/api/pull")
-async def pull_model(request_data: PullModelRequest): # Use specific model
-    """Pull a model from a registry"""
-    try:
-        # This functionality is Ollama-specific and not supported by LiteLLM
-        error_message = "Pulling models from a registry is not supported in this proxy implementation"
-        logger.warning(error_message)
-        # Return 501 Not Implemented with informative message
-        raise HTTPException(status_code=501, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in pull model endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def pull_model(request: PullModelRequest):
+    """Pull a model – not supported."""
+    logger.warning("POST /api/pull is not supported")
+    raise HTTPException(
+        status_code=501,
+        detail="Pulling models is not supported in this proxy implementation",
+    )
 
-# Push model stub
+
 @app.post("/api/push")
-async def push_model(request_data: PushModelRequest): # Use specific model
-    """Push a model to a registry"""
-    try:
-        # This functionality is Ollama-specific and not supported by LiteLLM
-        error_message = "Pushing models to a registry is not supported in this proxy implementation"
-        logger.warning(error_message)
-        # Return 501 Not Implemented with informative message
-        raise HTTPException(status_code=501, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in push model endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=11434, reload=True)
+async def push_model(request: PushModelRequest):
+    """Push a model – not supported."""
+    logger.warning("POST /api/push is not supported")
+    raise HTTPException(
+        status_code=501,
+        detail="Pushing models is not supported in this proxy implementation",
+    )

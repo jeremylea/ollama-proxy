@@ -1,96 +1,125 @@
-# Ollama API Proxy with LiteLLM
+# Ollama API Proxy
 
-A drop-in replacement for the Ollama API that uses LiteLLM in the backend to route requests to various LLM providers (OpenAI, Anthropic, etc.).
+A lightweight proxy server that implements the [Ollama API specification](https://github.com/ollama/ollama/blob/main/docs/api.md) and routes all requests to a configurable LiteLLM proxy backend. Designed as a drop-in replacement for Ollama, primarily targeting GitHub Copilot in VSCode.
 
-- Ensure https://github.com/ollama/ollama/blob/main/docs/api.md is fully supported
-- Use litellm in the backend: https://docs.litellm.ai/docs/#basic-usage
-- Optional tracing with langfuse https://docs.litellm.ai/docs/observability/langfuse_integration
+## Architecture
 
-## Features
+```
+GitHub Copilot (VSCode)  →  Ollama Proxy (this)  →  LiteLLM Proxy Server
+     (Ollama API)                (transforms)            (OpenAI API)
+```
 
-- Ollama API-compatible endpoints
-- Routes requests to various LLM providers using LiteLLM
-- Supports streaming responses
-- Built with FastAPI for high performance
+The proxy:
+- Accepts Ollama-compatible requests on port 11434
+- Transforms them to OpenAI-compatible format
+- Forwards to a LiteLLM proxy server
+- Transforms responses back to Ollama format
+- Supports streaming (SSE) for both `/api/generate` and `/api/chat`
 
 ## Prerequisites
 
 - Python 3.8+
-- API keys for the LLM providers you want to use
+- A running LiteLLM proxy server (e.g., `litellm --host 0.0.0.0 --port 4000`)
 
 ## Installation
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/yourusername/ollama-proxy.git
-   cd ollama-proxy
-   ```
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-2. Create a virtual environment and install dependencies using uv:
-   ```bash
-   uv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   uv sync
-   ```
-
-3. Create a `.env` file from the template:
-   ```bash
-   cp .env.example .env
-   ```
-
-4. Add your API keys to the `.env` file:
-   ```
-   OPENAI_API_KEY=your_openai_key
-   ANTHROPIC_API_KEY=your_anthropic_key
-   # Add other keys as needed
-   ```
-
-## Usage
-
-1. Start the server:
-   ```bash
-   python run.py
-   ```
-
-2. The server will be available at `http://localhost:11434` (the same port that Ollama uses by default).
-
-3. Use the API just like you would use the Ollama API:
-   ```bash
-   curl -X POST http://localhost:11434/api/generate -d '{
-     "model": "llama3",
-     "prompt": "Tell me a story about a robot learning to paint."
-   }'
-   ```
-
-## API Endpoints
-
-- `POST /api/generate` - Generate completions
-- `POST /api/chat` - Generate chat completions
-- `GET /api/models` - List available models
-- `GET /api/version` - Get version information
+# For development
+pip install -r requirements-dev.txt
+```
 
 ## Configuration
 
-You can configure the server by modifying the `.env` file:
+Copy the example environment file and configure it:
 
-- `PORT` - The port to run the server on (default: 11434)
-- `HOST` - The host to bind to (default: 0.0.0.0)
-- `LOG_LEVEL` - The logging level (default: INFO)
+```bash
+cp .env.example .env
+```
 
-## Model Mapping
+Edit `.env`:
 
-The service maps Ollama model names to the appropriate LiteLLM model names. You can customize this mapping in the `map_to_litellm_model` function in `app/main.py`.
+```bash
+# LiteLLM Proxy Configuration
+LITELLM_BASE_URL=http://localhost:4000
+LITELLM_API_KEY=your_api_key_here
 
-## Development
+# Server Configuration
+PORT=11434
+HOST=0.0.0.0
+LOG_LEVEL=info
+HTTP_TIMEOUT=300
+```
 
-   aider-google-free --yes-always --auto-test --test-cmd "uv run pytest" --auto-lint --lint-cmd "uv run ruff check --fix" --notifications 
+## Usage
+
+```bash
+# Start the server
+python run.py
+```
+
+The server will be available at `http://localhost:11434`.
+
+## API Endpoints
+
+### Implemented
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET/HEAD | Health check |
+| `/api/version` | GET | Return version info |
+| `/api/tags` | GET | List models (from LiteLLM `/v1/models`) |
+| `/api/generate` | POST | Generate completions |
+| `/api/chat` | POST | Chat completions |
+| `/api/embed` | POST | Generate embeddings |
+| `/api/show` | POST | Show model info |
+| `/api/ps` | GET | List running models |
+
+### Not Implemented (501)
+
+| Endpoint | Method |
+|----------|--------|
+| `/api/create` | POST |
+| `/api/copy` | POST |
+| `/api/delete` | DELETE |
+| `/api/pull` | POST |
+| `/api/push` | POST |
+
+## Testing
+
+```bash
+# Run all tests
+pytest
+
+# Run with verbose output
+pytest -v
+
+# Run specific test file
+pytest tests/test_api_endpoints.py -v
+```
+
+## Project Structure
+
+```
+ollama-proxy/
+├── .env.example          # Environment variable template
+├── requirements.txt       # Production dependencies
+├── requirements-dev.txt   # Development dependencies
+├── pytest.ini            # Pytest configuration
+├── run.py                # Entry point
+├── app/
+│   ├── __init__.py
+│   ├── config.py         # Configuration from environment
+│   ├── main.py           # FastAPI application and endpoints
+│   └── models.py         # Pydantic request/response models
+└── tests/
+    ├── conftest.py       # Pytest fixtures
+    ├── test_api_endpoints.py
+    └── test_streaming.py
+```
 
 ## License
 
 MIT
-
-## Acknowledgements
-
-- [Ollama](https://github.com/ollama/ollama) for the API design
-- [LiteLLM](https://github.com/BerriAI/litellm) for the unified LLM interface
-- [FastAPI](https://fastapi.tiangolo.com/) for the web framework

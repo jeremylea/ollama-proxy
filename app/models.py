@@ -1,86 +1,135 @@
 """
 Pydantic models for the Ollama API proxy.
-"""
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 
+Matches the Ollama API specification:
+https://github.com/ollama/ollama/blob/main/docs/api.md
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Union
+
+
+# ── Request Models ──────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    """Request model for the /api/generate endpoint"""
+    """Request model for POST /api/generate"""
     model: str
-    prompt: str
-    images: Optional[List[str]] = None  # List of base64-encoded images
+    prompt: str = ""
     suffix: Optional[str] = None
+    images: Optional[List[str]] = None
     system: Optional[str] = None
     template: Optional[str] = None
-    context: Optional[List[int]] = None # Deprecated
+    context: Optional[List[int]] = None
+    stream: bool = True
+    raw: bool = False
+    keep_alive: Optional[str] = None
     options: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    format: Optional[str] = None # Can be "json" or a JSON schema dict
-    stream: Optional[bool] = False
-    raw: Optional[bool] = False
-    keep_alive: Optional[str] = None # E.g., "5m"
-
-
-class GenerateResponse(BaseModel):
-    """Response model for the /api/generate endpoint"""
-    model: str
-    created_at: str
-    response: str # Empty if streamed
-    done: bool
-    done_reason: Optional[str] = None # E.g., "stop", "length", "load", "error", "unload"
-    context: Optional[List[int]] = None # Deprecated, but part of the spec response
-    total_duration: Optional[int] = None # Nanoseconds
-    load_duration: Optional[int] = None # Nanoseconds
-    prompt_eval_count: Optional[int] = None
-    prompt_eval_duration: Optional[int] = None # Nanoseconds
-    eval_count: Optional[int] = None
-    eval_duration: Optional[int] = None # Nanoseconds
-
-
-class ToolCall(BaseModel):
-    """Tool call information"""
-    function: Dict[str, Any] # {"name": "...", "arguments": {...}}
+    format: Optional[Union[str, Dict[str, Any]]] = None
 
 
 class ChatMessage(BaseModel):
-    """A chat message"""
-    role: str # system, user, assistant, tool
-    content: str
-    images: Optional[List[str]] = None # List of base64-encoded images
-    tool_calls: Optional[List[ToolCall]] = None # Only for assistant messages requesting tool use
+    """A single chat message."""
+    role: str
+    content: str = ""
+    images: Optional[List[str]] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatRequest(BaseModel):
-    """Request model for the /api/chat endpoint"""
+    """Request model for POST /api/chat"""
     model: str
-    messages: List[ChatMessage]
-    tools: Optional[List[Dict[str, Any]]] = None # List of tools
-    stream: Optional[bool] = True # Default to streaming
+    messages: List[ChatMessage] = []
+    stream: bool = True
+    tools: Optional[List[Dict[str, Any]]] = None
     options: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    format: Optional[str] = None # Can be "json" or a JSON schema dict
-    keep_alive: Optional[str] = None # E.g., "5m"
+    format: Optional[Union[str, Dict[str, Any]]] = None
+    keep_alive: Optional[str] = None
+
+
+class EmbeddingRequest(BaseModel):
+    """Request model for POST /api/embed"""
+    model: str
+    input: Union[str, List[str]]
+    truncate: Optional[bool] = None
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    keep_alive: Optional[str] = None
+
+
+class ShowModelRequest(BaseModel):
+    """Request model for POST /api/show"""
+    model: str
+    verbose: Optional[bool] = False
+
+
+class CreateModelRequest(BaseModel):
+    """Request model for POST /api/create (stub)"""
+    model: str
+    path: Optional[str] = None
+    modelfile: Optional[str] = None
+    stream: Optional[bool] = False
+
+
+class CopyModelRequest(BaseModel):
+    """Request model for POST /api/copy (stub)"""
+    source: str
+    destination: str
+
+
+class DeleteModelRequest(BaseModel):
+    """Request model for DELETE /api/delete (stub)"""
+    model: str
+
+
+class PullModelRequest(BaseModel):
+    """Request model for POST /api/pull (stub)"""
+    model: str
+    insecure: Optional[bool] = False
+    stream: Optional[bool] = False
+
+
+class PushModelRequest(BaseModel):
+    """Request model for POST /api/push (stub)"""
+    model: str
+    insecure: Optional[bool] = False
+    stream: Optional[bool] = False
+
+
+# ── Response Models ─────────────────────────────────────────────────────────
+
+class GenerateResponse(BaseModel):
+    """Response model for POST /api/generate"""
+    model: str
+    created_at: str
+    response: str = ""
+    done: bool = False
+    done_reason: Optional[str] = None
+    context: Optional[List[int]] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
+    prompt_eval_duration: Optional[int] = None
+    eval_count: Optional[int] = None
+    eval_duration: Optional[int] = None
 
 
 class ChatResponse(BaseModel):
-    """Response model for the /api/chat endpoint"""
+    """Response model for POST /api/chat"""
     model: str
     created_at: str
-    message: ChatMessage # Empty content if streamed
-    done: bool
-    done_reason: Optional[str] = None # E.g., "stop", "length", "load", "error", "unload", "tool_calls"
-    total_duration: Optional[int] = None # Nanoseconds
-    load_duration: Optional[int] = None # Nanoseconds
+    message: ChatMessage
+    done: bool = False
+    done_reason: Optional[str] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
     prompt_eval_count: Optional[int] = None
-    prompt_eval_duration: Optional[int] = None # Nanoseconds
+    prompt_eval_duration: Optional[int] = None
     eval_count: Optional[int] = None
-    eval_duration: Optional[int] = None # Nanoseconds
+    eval_duration: Optional[int] = None
 
 
 class ModelDetails(BaseModel):
-    """Model details"""
-    format: Optional[str] = None
-    family: Optional[str] = None
-    parent_model: Optional[str] = None # Added in /api/show response
+    """Model technical details."""
+    parent_model: Optional[str] = None
     format: Optional[str] = None
     family: Optional[str] = None
     families: Optional[List[str]] = None
@@ -89,7 +138,7 @@ class ModelDetails(BaseModel):
 
 
 class ModelInfo(BaseModel):
-    """Model information"""
+    """Model information for /api/tags response."""
     name: str
     modified_at: str
     size: int
@@ -98,96 +147,44 @@ class ModelInfo(BaseModel):
 
 
 class ListTagsResponse(BaseModel):
-    """Response model for the /api/tags endpoint"""
-    models: List[ModelInfo]
-
-
-class EmbeddingRequest(BaseModel):
-    """Request model for the /api/embed endpoint"""
-    model: str
-    input: str | List[str] # Renamed from prompt, can be string or list
-    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    truncate: Optional[bool] = True
-    keep_alive: Optional[str] = None
+    """Response model for GET /api/tags"""
+    models: List[ModelInfo] = []
 
 
 class EmbeddingResponse(BaseModel):
-    """Response model for the /api/embed endpoint"""
-    model: str # Added model field
-    embeddings: List[List[float]] # Changed from embedding: List[float]
-    total_duration: Optional[int] = None # Nanoseconds
-    load_duration: Optional[int] = None # Nanoseconds
+    """Response model for POST /api/embed"""
+    model: str
+    embeddings: List[List[float]]
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
     prompt_eval_count: Optional[int] = None
 
 
 class ShowModelResponse(BaseModel):
-    """Response model for the /api/show endpoint"""
-    license: str
-    modelfile: str
-    parameters: str
-    template: str
-    details: ModelDetails
-    model_info: Optional[Dict[str, Any]] = None # Added model_info field
-    capabilities: Optional[List[str]] = None # Added capabilities field
-
-
-class ShowModelRequest(BaseModel):
-    """Request model for the POST /api/show endpoint"""
-    model: str
-    verbose: Optional[bool] = False
+    """Response model for POST /api/show"""
+    modelfile: Optional[str] = None
+    license: Optional[str] = None
+    parameters: Optional[str] = None
+    template: Optional[str] = None
+    details: Optional[ModelDetails] = None
+    model_info: Optional[Dict[str, Any]] = None
+    capabilities: Optional[List[str]] = None
 
 
 class PsModelInfo(BaseModel):
-    """Model information for the /api/ps endpoint"""
+    """Model info for /api/ps response."""
     name: str
     model: str
     size: int
     digest: str
     details: ModelDetails
-    expires_at: Optional[str] = None # ISO 8601 format
+    expires_at: Optional[str] = None
     size_vram: Optional[int] = None
 
 
 class PsResponse(BaseModel):
-    """Response model for the /api/ps endpoint"""
-    models: List[PsModelInfo]
-
-
-# --- Models for Stubbed Endpoints ---
-
-class CreateModelRequest(BaseModel):
-    """Request model for POST /api/create"""
-    name: str # Changed from 'model' to 'name' to match Ollama API
-    path: Optional[str] = None # Path to Modelfile (if used locally, not via API body)
-    modelfile: Optional[str] = None # Content of the Modelfile
-    stream: Optional[bool] = False
-    # Ollama spec has many more fields here (from, files, adapters, etc.)
-    # Keeping it simple as it's a stub.
-
-
-class CopyModelRequest(BaseModel):
-    """Request model for POST /api/copy"""
-    source: str
-    destination: str
-
-
-class DeleteModelRequest(BaseModel):
-    """Request model for DELETE /api/delete"""
-    name: str # Changed from 'model' to 'name' to match Ollama API
-
-
-class PullModelRequest(BaseModel):
-    """Request model for POST /api/pull"""
-    name: str # Changed from 'model' to 'name' to match Ollama API
-    insecure: Optional[bool] = False
-    stream: Optional[bool] = False
-
-
-class PushModelRequest(BaseModel):
-    """Request model for POST /api/push"""
-    name: str # Changed from 'model' to 'name' to match Ollama API
-    insecure: Optional[bool] = False
-    stream: Optional[bool] = False
+    """Response model for GET /api/ps"""
+    models: List[PsModelInfo] = []
 
 
 class VersionResponse(BaseModel):

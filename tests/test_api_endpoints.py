@@ -1,197 +1,338 @@
 """
-Test the main API endpoints of the Ollama API proxy.
+Tests for the main API endpoints of the Ollama API proxy.
 """
+
+import json
 import pytest
-from unittest.mock import MagicMock, patch
-from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+from httpx import ConnectError, TimeoutException
 
 
 def test_root_endpoint(test_client):
     """Test the root endpoint."""
     response = test_client.get("/")
     assert response.status_code == 200
-    assert "message" in response.json()
-    assert "Ollama API compatibility layer" in response.json()["message"]
+    data = response.json()
+    assert "message" in data
+
+
+def test_root_head(test_client):
+    """Test the HEAD root endpoint."""
+    response = test_client.head("/")
+    assert response.status_code == 200
 
 
 def test_version_endpoint(test_client):
     """Test the version endpoint."""
     response = test_client.get("/api/version")
     assert response.status_code == 200
-    assert "version" in response.json()
+    data = response.json()
+    assert "version" in data
 
 
-def test_models_endpoint(test_client):
-    """Test the models endpoint."""
-    response = test_client.get("/api/models")
+def test_ps_endpoint(test_client):
+    """Test the /api/ps endpoint."""
+    response = test_client.get("/api/ps")
     assert response.status_code == 200
-    assert "models" in response.json()
-    assert len(response.json()["models"]) > 0
-    assert "name" in response.json()["models"][0]
-    assert "modified_at" in response.json()["models"][0]
-    assert "details" in response.json()["models"][0]
+    data = response.json()
+    assert "models" in data
+    assert isinstance(data["models"], list)
 
 
-def test_show_model_endpoint(test_client):
-    """Test the show model endpoint (POST)."""
-    model_name = "llama3"
-    request_data = {"model": model_name}
-    response = test_client.post("/api/show", json=request_data) # Changed to POST and use JSON body
+def test_show_endpoint(test_client):
+    """Test the POST /api/show endpoint."""
+    response = test_client.post("/api/show", json={"model": "gpt-4o"})
     assert response.status_code == 200
-    assert "license" in response.json()
-    assert "modelfile" in response.json()
-    assert "details" in response.json()
-    assert model_name in response.json()["modelfile"] # Check if original name is in modelfile placeholder
+    data = response.json()
+    assert "modelfile" in data
 
 
-def test_ps_endpoint(test_client): # Renamed test function
-    """Test the ps endpoint (formerly status)."""
-    response = test_client.get("/api/ps") # Updated path
-    assert response.status_code == 200
-    assert "models" in response.json() # Updated assertion for PsResponse
-    assert isinstance(response.json()["models"], list) # Updated assertion
-
-
-@pytest.mark.parametrize("endpoint", [
-    "/api/create",
-    "/api/copy",
-    "/api/pull",
-    "/api/push"
+@pytest.mark.parametrize("endpoint,method,body", [
+    ("/api/create", "post", {"model": "test"}),
+    ("/api/copy", "post", {"source": "src", "destination": "dst"}),
+    ("/api/pull", "post", {"model": "test"}),
+    ("/api/push", "post", {"model": "test"}),
 ])
-def test_unsupported_endpoints_post(test_client, endpoint):
-    """Test unsupported POST endpoints."""
-    # Determine the correct request body based on the endpoint
-    if endpoint == "/api/copy":
-        request_body = {"source": "test-src", "destination": "test-dest"}
-    else: # /api/create, /api/pull, /api/push expect 'name'
-        request_body = {"name": "test"}
-
-    response = test_client.post(endpoint, json=request_body)
+def test_unsupported_post_endpoints(test_client, endpoint, method, body):
+    """Test unsupported POST endpoints return 501."""
+    client_method = getattr(test_client, method)
+    response = client_method(endpoint, json=body)
     assert response.status_code == 501
     assert "detail" in response.json()
 
 
-
-def test_unsupported_endpoint_delete(test_client):
-    """Test unsupported DELETE endpoint."""
-    response = test_client.request(
-        "DELETE",
-        "/api/delete",
-        json={"name": "test"} # Use 'name' field
-    )
+def test_unsupported_delete_endpoint(test_client):
+    """Test unsupported DELETE endpoint returns 501."""
+    response = test_client.request("DELETE", "/api/delete", json={"model": "test"})
     assert response.status_code == 501
     assert "detail" in response.json()
 
 
-@patch('app.main.litellm.acompletion') # Target acompletion
-def test_generate_endpoint(mock_acompletion, test_client): # Rename mock arg
-    """Test the generate endpoint."""
-    # Mock litellm completion response
+@patch("app.main.get_http_client")
+def test_generate_non_streaming(mock_get_client, test_client):
+    """Test the generate endpoint with stream=false."""
+    mock_client = AsyncMock()
     mock_response = MagicMock()
-    mock_response.created = datetime.now().timestamp()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "This is a test response."
-    mock_acompletion.return_value = mock_response # Use renamed mock arg
-    
-    # Make a request to generate endpoint
-    request_data = {
-        "model": "llama3",
-        "prompt": "Tell me about Python.",
-        "system": "You are a helpful assistant.",
-        "stream": False
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [{
+            "message": {"content": "This is a test response.", "role": "assistant"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 10},
     }
-    response = test_client.post("/api/generate", json=request_data)
-    
-    # Verify response
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "Hello",
+        "stream": False,
+    })
+
     assert response.status_code == 200
-    assert "model" in response.json()
-    assert "response" in response.json()
-    assert "done" in response.json()
-    assert response.json()["model"] == "llama3"
-    assert response.json()["response"] == "This is a test response."
-    assert response.json()["done"] is True
+    data = response.json()
+    assert data["model"] == "gpt-4o"
+    assert data["response"] == "This is a test response."
+    assert data["done"] is True
+    assert data["prompt_eval_count"] == 5
+    assert data["eval_count"] == 10
 
-    # Verify litellm was called correctly
-    mock_acompletion.assert_called_once() # Use renamed mock arg
-    args, kwargs = mock_acompletion.call_args # Use renamed mock arg
-    assert kwargs["model"] == "ollama/llama3"
-    assert len(kwargs["messages"]) == 2
-    assert kwargs["messages"][0]["role"] == "system"
-    assert kwargs["messages"][1]["role"] == "user"
-    assert kwargs["messages"][1]["content"] == "Tell me about Python."
+    # Verify the request sent to LiteLLM
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    assert call_kwargs[0][0] == "/v1/chat/completions"
+    body = call_kwargs[1]["json"]
+    assert body["model"] == "gpt-4o"
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["role"] == "user"
+    assert body["messages"][0]["content"] == "Hello"
 
 
-@patch('app.main.litellm.acompletion') # Target acompletion
-def test_chat_endpoint(mock_acompletion, test_client): # Rename mock arg
-    """Test the chat endpoint."""
-    # Mock litellm completion response
+@patch("app.main.get_http_client")
+def test_generate_with_system(mock_get_client, test_client):
+    """Test generate with a system prompt."""
+    mock_client = AsyncMock()
     mock_response = MagicMock()
-    mock_response.created = datetime.now().timestamp()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "I'm doing well, how are you?"
-    mock_acompletion.return_value = mock_response # Use renamed mock arg
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": "OK", "role": "assistant"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+    }
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
 
-    # Make a request to chat endpoint
-    request_data = {
-        "model": "llama3",
-        "messages": [
-            {"role": "user", "content": "Hello, how are you?"}
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "Hi",
+        "system": "You are helpful.",
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    call_kwargs = mock_client.post.call_args
+    body = call_kwargs[1]["json"]
+    assert len(body["messages"]) == 2
+    assert body["messages"][0]["role"] == "system"
+    assert body["messages"][0]["content"] == "You are helpful."
+
+
+@patch("app.main.get_http_client")
+def test_generate_empty_prompt(mock_get_client, test_client):
+    """Test generate with empty prompt returns load response."""
+    mock_client = AsyncMock()
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "",
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["done"] is True
+    assert data["done_reason"] == "load"
+    assert data["response"] == ""
+    # Should NOT call LiteLLM
+    mock_client.post.assert_not_called()
+
+
+@patch("app.main.get_http_client")
+def test_chat_non_streaming(mock_get_client, test_client):
+    """Test the chat endpoint with stream=false."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [{
+            "message": {"content": "Hello! How can I help?", "role": "assistant"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 8, "completion_tokens": 6},
+    }
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/chat", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi there"}],
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["model"] == "gpt-4o"
+    assert data["message"]["role"] == "assistant"
+    assert data["message"]["content"] == "Hello! How can I help?"
+    assert data["done"] is True
+    assert data["prompt_eval_count"] == 8
+    assert data["eval_count"] == 6
+
+
+@patch("app.main.get_http_client")
+def test_chat_empty_messages(mock_get_client, test_client):
+    """Test chat with empty messages returns load response."""
+    mock_client = AsyncMock()
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/chat", json={
+        "model": "gpt-4o",
+        "messages": [],
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["done"] is True
+    assert data["done_reason"] == "load"
+    mock_client.post.assert_not_called()
+
+
+@patch("app.main.get_http_client")
+def test_embed_endpoint(mock_get_client, test_client):
+    """Test the embed endpoint."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "data": [
+            {"embedding": [0.1, 0.2, 0.3]},
         ],
-        "stream": False # Explicitly disable streaming for this test
+        "usage": {"prompt_tokens": 3},
     }
-    response = test_client.post("/api/chat", json=request_data)
-    # Verify response
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/embed", json={
+        "model": "text-embedding-3-small",
+        "input": "Hello world",
+    })
+
     assert response.status_code == 200
-    assert "model" in response.json()
-    assert "message" in response.json()
-    assert "done" in response.json()
-    assert response.json()["model"] == "llama3"
-    assert response.json()["message"]["role"] == "assistant"
-    assert response.json()["message"]["content"] == "I'm doing well, how are you?"
-    assert response.json()["done"] is True
-
-    # Verify litellm was called correctly
-    mock_acompletion.assert_called_once() # Use renamed mock arg
-    args, kwargs = mock_acompletion.call_args # Use renamed mock arg
-    assert kwargs["model"] == "ollama/llama3"
-    assert len(kwargs["messages"]) == 1
-    assert kwargs["messages"][0]["role"] == "user"
-    assert kwargs["messages"][0]["content"] == "Hello, how are you?"
+    data = response.json()
+    assert data["model"] == "text-embedding-3-small"
+    assert len(data["embeddings"]) == 1
+    assert data["embeddings"][0] == [0.1, 0.2, 0.3]
 
 
-@patch('app.main.litellm.embedding')
-def test_embed_endpoint(mock_embedding, test_client): # Renamed test function
-    """Test the embed endpoint (formerly embeddings)."""
-    # Mock litellm embedding response
+@patch("app.main.get_http_client")
+def test_generate_backend_unavailable(mock_get_client, test_client):
+    """Test generate when LiteLLM proxy is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "Hello",
+        "stream": False,
+    })
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_chat_backend_unavailable(mock_get_client, test_client):
+    """Test chat when LiteLLM proxy is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/chat", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+    })
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_generate_timeout(mock_get_client, test_client):
+    """Test generate when LiteLLM proxy times out."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = TimeoutException("Timeout")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/generate", json={
+        "model": "gpt-4o",
+        "prompt": "Hello",
+        "stream": False,
+    })
+
+    assert response.status_code == 504
+    assert "Backend proxy timeout" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_generate_litellm_error(mock_get_client, test_client):
+    """Test generate when LiteLLM returns an error."""
+    mock_client = AsyncMock()
     mock_response = MagicMock()
-    mock_response.model = "ollama/mxbai-embed-large" # LiteLLM response includes model
-    mock_response.data = [MagicMock()]
-    mock_response.data[0].embedding = [0.1, 0.2, 0.3, 0.4, 0.5]
-    # Add mock usage data if needed by the response model (total_duration, etc.)
-    mock_response.usage = MagicMock()
-    mock_response.usage.prompt_tokens = 5 # Example value
-    mock_embedding.return_value = mock_response
-
-    # Make a request to embed endpoint
-    request_data = {
-        "model": "mxbai-embed-large",
-        "input": "Hello, world!" # Changed from prompt to input
+    mock_response.status_code = 400
+    mock_response.json.return_value = {
+        "error": {"message": "Invalid model", "type": "invalid_request_error"}
     }
-    response = test_client.post("/api/embed", json=request_data) # Updated path
+    mock_response.text = ""
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
 
-    # Verify response
-    assert response.status_code == 200
-    assert "model" in response.json() # Check for model field
-    assert "embeddings" in response.json() # Changed from embedding to embeddings
-    assert isinstance(response.json()["embeddings"], list)
-    assert isinstance(response.json()["embeddings"][0], list) # It's a list of lists
-    assert len(response.json()["embeddings"][0]) == 5
-    assert response.json()["model"] == "mxbai-embed-large" # Check model name in response
+    response = test_client.post("/api/generate", json={
+        "model": "bad-model",
+        "prompt": "Hello",
+        "stream": False,
+    })
 
-    # Verify litellm was called correctly
-    mock_embedding.assert_called_once()
-    args, kwargs = mock_embedding.call_args
-    # The model mapping now passes the name directly without the 'ollama/' prefix
-    assert kwargs["model"] == "mxbai-embed-large"
-    # LiteLLM embedding expects a list, even for single input
-    assert kwargs["input"] == ["Hello, world!"]
+    assert response.status_code == 400
+    assert "Invalid model" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_tags_backend_unavailable(mock_get_client, test_client):
+    """Test /api/tags when LiteLLM proxy is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.get("/api/tags")
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_embed_backend_unavailable(mock_get_client, test_client):
+    """Test /api/embed when LiteLLM proxy is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/api/embed", json={
+        "model": "text-embedding-3-small",
+        "input": "Hello",
+    })
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]

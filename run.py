@@ -1,22 +1,15 @@
-import uvicorn
-import os
-from dotenv import load_dotenv
-from app.config import DEFAULT_PORT, DEFAULT_HOST, DEFAULT_LOG_LEVEL
+"""Entry point for the Ollama API proxy server."""
 
-# Load environment variables
-load_dotenv()
+import uvicorn
+from app.config import settings
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", str(DEFAULT_PORT)))
-    host = os.getenv("HOST", DEFAULT_HOST)
-    log_level = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).lower()
-    
-    print(f"Starting Ollama API compatibility server on {host}:{port}")
-    
+    print(f"Starting Ollama API proxy on {settings.HOST}:{settings.PORT}")
+    print(f"LiteLLM backend: {settings.LITELLM_BASE_URL}")
+
     uvicorn.run(
         "app.main:app",
-        host=host,
-        port=port,
-        reload=True,
-        log_level=log_level
+        host=settings.HOST,
+        port=settings.PORT,
+        log_level=settings.LOG_LEVEL,
     )
