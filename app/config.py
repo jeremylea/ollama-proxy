@@ -26,7 +26,7 @@ class Settings:
     HTTP_TIMEOUT: float = float(os.getenv("HTTP_TIMEOUT", "300.0"))
 
     # Proxy version string returned by /api/version
-    VERSION: str = "0.23.1"
+    VERSION: str = "0.6.4"
 
 
 settings = Settings()

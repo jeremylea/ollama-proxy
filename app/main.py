@@ -112,12 +112,16 @@ def map_options_to_openai(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "top_k": "top_k",
         "max_tokens": "max_tokens",
         "num_predict": "max_tokens",
-        "num_ctx": "max_tokens",
         "repeat_penalty": "frequency_penalty",
         "frequency_penalty": "frequency_penalty",
         "presence_penalty": "presence_penalty",
         "seed": "seed",
         "stop": "stop",
+    }
+
+    ignored_keys = {
+        "num_ctx", "num_thread", "num_keep", "tfs_z", "typical_p",
+        "mirostat", "mirostat_tau", "mirostat_eta", "penalize_newline"
     }
 
     result: Dict[str, Any] = {}
@@ -127,7 +131,7 @@ def map_options_to_openai(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     # Pass through any extra options that might be understood by LiteLLM
     for key, value in options.items():
-        if key not in param_map:
+        if key not in param_map and key not in ignored_keys:
             result[key] = value
 
     return result
@@ -150,7 +154,20 @@ def build_openai_messages_chat(
     """Build OpenAI messages array from Ollama chat messages."""
     result: List[Dict[str, Any]] = []
     for msg in messages:
-        entry: Dict[str, Any] = {"role": msg.role, "content": msg.content}
+        entry: Dict[str, Any] = {"role": msg.role}
+        if msg.images:
+            content_list: List[Dict[str, Any]] = []
+            if msg.content:
+                content_list.append({"type": "text", "text": msg.content})
+            for img in msg.images:
+                content_list.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img}"}
+                })
+            entry["content"] = content_list
+        else:
+            entry["content"] = msg.content
+            
         if msg.tool_calls:
             entry["tool_calls"] = msg.tool_calls
         result.append(entry)
@@ -420,10 +437,14 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
         else:
             family = "unknown"
 
+        created_val = m.get("created")
+        if created_val is None:
+            created_val = 0
+
         model_info = ModelInfo(
             name=id_,
             modified_at=datetime.fromtimestamp(
-                m.get("created", 0), tz=timezone.utc
+                created_val, tz=timezone.utc
             ).isoformat(),
             size=m.get("size", 0) or 0,
             digest=digest,
@@ -431,8 +452,8 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
                 format=m.get("object", "model"),
                 family=family,
                 families=[family],
-                parameter_size=m.get("parameter_size"),
-                quantization_level=m.get("quantization_level"),
+                parameter_size=m.get("parameter_size") or "8B",
+                quantization_level=m.get("quantization_level") or "Q4_0",
             ),
         )
         models.append(model_info)
