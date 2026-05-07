@@ -461,6 +461,9 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
     Only includes models that are present in both the LiteLLM response and
     config.yaml (MODEL_METADATA). Models from LiteLLM without a config entry
     are silently dropped.
+    
+    Each model name includes the ':latest' tag suffix to match Ollama's
+    naming convention (e.g. 'llama3.2:latest').
     """
     models: List[ModelInfo] = []
     for m in data.get("data", []):
@@ -472,14 +475,18 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
             continue
 
         metadata = MODEL_METADATA[id_]
-        digest = "sha256:" + hashlib.sha256(id_.encode()).hexdigest()
+        
+        # Ollama uses model:tag format, where tag defaults to 'latest'
+        model_name = f"{id_}:latest"
+        digest = "sha256:" + hashlib.sha256(model_name.encode()).hexdigest()
 
         created_val = m.get("created")
         if created_val is None:
             created_val = 0
 
         model_info = ModelInfo(
-            name=id_,
+            name=model_name,
+            model=model_name,
             modified_at=datetime.fromtimestamp(
                 created_val, tz=timezone.utc
             ).isoformat(),

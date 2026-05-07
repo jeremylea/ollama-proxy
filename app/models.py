@@ -138,8 +138,13 @@ class ModelDetails(BaseModel):
 
 
 class ModelInfo(BaseModel):
-    """Model information for /api/tags response."""
+    """Model information for /api/tags response.
+    
+    Matches Ollama spec: both 'name' and 'model' are required,
+    and both include the tag suffix (e.g. 'llama3.2:latest').
+    """
     name: str
+    model: str
     modified_at: str
     size: int
     digest: str

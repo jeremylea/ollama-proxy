@@ -54,13 +54,16 @@ def _test_tags_endpoint_impl(mock_get_client, test_client):
     assert "models" in data
     assert len(data["models"]) == 2
 
+    # Ollama uses model:tag format, so names include ':latest'
     names = [m["name"] for m in data["models"]]
-    assert "gpt-4o" in names
-    assert "claude-3-5-sonnet-20241022" in names
+    assert "gpt-4o:latest" in names
+    assert "claude-3-5-sonnet-20241022:latest" in names
 
-    # Check model structure
+    # Check model structure matches Ollama spec
     for model in data["models"]:
         assert "name" in model
+        assert "model" in model  # Ollama spec requires both 'name' and 'model'
+        assert model["name"] == model["model"]  # Both should be identical
         assert "modified_at" in model
         assert "size" in model
         assert "digest" in model
@@ -150,9 +153,10 @@ def _test_tags_model_families_impl(mock_get_client, test_client):
     # "some-unknown-model" is not in config, so it should be filtered out
     assert len(data["models"]) == 5
 
+    # Ollama uses model:tag format, so names include ':latest'
     families = {m["name"]: m["details"]["family"] for m in data["models"]}
-    assert families["gpt-4o"] == "gpt"
-    assert families["claude-3-opus"] == "claude"
-    assert families["gemini-pro"] == "gemini"
-    assert families["llama3.1"] == "llama"
-    assert families["mistral-large"] == "mistral"
+    assert families["gpt-4o:latest"] == "gpt"
+    assert families["claude-3-opus:latest"] == "claude"
+    assert families["gemini-pro:latest"] == "gemini"
+    assert families["llama3.1:latest"] == "llama"
+    assert families["mistral-large:latest"] == "mistral"
