@@ -1,5 +1,6 @@
 models:
   qwen3-coder:
+    hf_id: Qwen/Qwen3-Coder-Next-FP8
     family: qwen2
     parameter_size: "235B"
     quantization_level: "FP8"
@@ -29,6 +30,7 @@ models:
       - tools
 
   qwen36-27b:
+    hf_id: Qwen/Qwen3.6-27B-FP8
     family: qwen2
     parameter_size: "27B"
     quantization_level: "FP8"

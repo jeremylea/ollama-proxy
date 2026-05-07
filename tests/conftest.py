@@ -4,6 +4,10 @@ Pytest configuration file with fixtures for testing.
 
 import os
 import sys
+
+# Disable Hugging Face metadata enrichment during tests to avoid network calls
+os.environ["HF_METADATA_ENABLED"] = "0"
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient

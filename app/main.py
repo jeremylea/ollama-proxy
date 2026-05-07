@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from app.config import settings, setup_logging, MODEL_METADATA
+from app.config import settings, setup_logging, MODEL_METADATA, initialize_model_metadata
 from app.models import (
     GenerateRequest,
     GenerateResponse,
@@ -77,6 +77,9 @@ async def lifespan(app: FastAPI):
         headers=headers,
         timeout=httpx.Timeout(settings.HTTP_TIMEOUT, connect=10.0),
     )
+
+    # Load model metadata from YAML and enrich with Hugging Face API
+    await initialize_model_metadata(_http_client)
 
     yield
 
