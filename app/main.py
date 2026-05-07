@@ -494,8 +494,8 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
             digest=digest,
             details=ModelDetails(
                 format=metadata.get("format", "gguf"),
-                family=metadata["family"],
-                families=[metadata["family"]],
+                family=metadata.get("family", "unknown"),
+                families=[metadata.get("family", "unknown")],
                 parameter_size=metadata.get("parameter_size", "8B"),
                 quantization_level=metadata.get("quantization_level", "Q4_0"),
             ),
@@ -511,7 +511,8 @@ def handle_litellm_error(response: httpx.Response) -> None:
     status_code = response.status_code
     try:
         error_data = response.json()
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to parse LiteLLM error response: %s", e)
         error_data = {}
 
     detail = error_data.get("error", {})
@@ -776,8 +777,8 @@ async def show(request: ShowModelRequest):
         license="",
         details=ModelDetails(
             format=metadata.get("format", "gguf"),
-            family=metadata["family"],
-            families=[metadata["family"]],
+            family=metadata.get("family", "unknown"),
+            families=[metadata.get("family", "unknown")],
             parameter_size=metadata.get("parameter_size", "8B"),
             quantization_level=metadata.get("quantization_level", "Q4_0"),
         ),

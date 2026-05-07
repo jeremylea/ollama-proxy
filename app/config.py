@@ -217,7 +217,8 @@ async def _get_litellm_model_key(
 
     try:
         data = response.json()
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to parse LiteLLM model info response: %s", e)
         return None
 
     items = data.get("data", [])
