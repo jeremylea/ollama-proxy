@@ -845,3 +845,95 @@ async def push_model(request: PushModelRequest):
         status_code=501,
         detail="Pushing models is not supported in this proxy implementation",
     )
+
+
+# ── OpenAI-compatible pass-through endpoints ────────────────────────────────
+# GitHub Copilot and other OpenAI SDK clients expect these routes.
+# We forward them directly to LiteLLM since it already speaks OpenAI format.
+
+
+async def _proxy_post(
+    path: str, body: Dict[str, Any], stream: bool
+) -> Union[StreamingResponse, JSONResponse]:
+    """Generic helper that POSTs to LiteLLM and returns the response."""
+    client = await get_http_client()
+    try:
+        response = await client.post(path, json=body, stream=stream)
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=502, detail="Backend proxy unavailable")
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=504, detail="Backend proxy timeout")
+
+    if response.status_code != 200:
+        await handle_litellm_error(response)
+
+    if stream:
+        async def _passthrough() -> AsyncGenerator[str, None]:
+            try:
+                async for line in response.aiter_lines():
+                    yield line + "\n"
+            finally:
+                await response.aclose()
+        return StreamingResponse(
+            _passthrough(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    data = response.json()
+    return JSONResponse(content=data)
+
+
+async def _proxy_get(path: str) -> JSONResponse:
+    """Generic helper that GETs from LiteLLM and returns the JSON response."""
+    client = await get_http_client()
+    try:
+        response = await client.get(path)
+    except httpx.ConnectError as e:
+        logger.error("Cannot connect to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=502, detail="Backend proxy unavailable")
+    except httpx.TimeoutException as e:
+        logger.error("Timeout connecting to LiteLLM proxy: %s", e)
+        raise HTTPException(status_code=504, detail="Backend proxy timeout")
+
+    if response.status_code != 200:
+        await handle_litellm_error(response)
+
+    data = response.json()
+    return JSONResponse(content=data)
+
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint.
+
+    Forwards the request directly to LiteLLM's /v1/chat/completions.
+    Supports both streaming and non-streaming modes.
+    """
+    body: Dict[str, Any] = await request.json()
+    stream = body.get("stream", False)
+    logger.info("v1/chat/completions: model=%s, stream=%s", body.get("model"), stream)
+    return await _proxy_post("/v1/chat/completions", body, stream)
+
+
+@app.get("/v1/models")
+async def v1_models():
+    """OpenAI-compatible models listing endpoint.
+
+    Forwards to LiteLLM's /v1/models.
+    """
+    logger.info("v1/models request")
+    return await _proxy_get("/v1/models")
+
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(request: Request):
+    """OpenAI-compatible embeddings endpoint.
+
+    Forwards the request directly to LiteLLM's /v1/embeddings.
+    """
+    body: Dict[str, Any] = await request.json()
+    logger.info("v1/embeddings: model=%s", body.get("model"))
+    return await _proxy_post("/v1/embeddings", body, stream=False)

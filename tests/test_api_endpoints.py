@@ -356,3 +356,168 @@ def test_embed_backend_unavailable(mock_get_client, test_client):
 
     assert response.status_code == 502
     assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+# ── OpenAI-compatible /v1/ pass-through endpoints ───────────────────────────
+
+
+@patch("app.main.get_http_client")
+def test_v1_chat_completions_non_streaming(mock_get_client, test_client):
+    """Test /v1/chat/completions pass-through with stream=false."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "id": "chatcmpl-123",
+        "choices": [{
+            "message": {"content": "Hello!", "role": "assistant"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+    }
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/v1/chat/completions", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "chatcmpl-123"
+    assert data["choices"][0]["message"]["content"] == "Hello!"
+
+    # Verify the request was forwarded as-is to LiteLLM
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    assert call_kwargs[0][0] == "/v1/chat/completions"
+    body = call_kwargs[1]["json"]
+    assert body["model"] == "gpt-4o"
+    assert body["messages"] == [{"role": "user", "content": "Hi"}]
+
+
+@patch("app.main.get_http_client")
+def test_v1_chat_completions_streaming(mock_get_client, test_client):
+    """Test /v1/chat/completions pass-through with stream=true."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+
+    async def _aiter_lines():
+        for line in [
+            "data: {\"id\":\"chatcmpl-123\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}",
+            "data: [DONE]",
+        ]:
+            yield line
+
+    mock_response.aiter_lines = _aiter_lines
+    mock_response.aclose = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/v1/chat/completions", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+
+
+@patch("app.main.get_http_client")
+def test_v1_chat_completions_backend_unavailable(mock_get_client, test_client):
+    """Test /v1/chat/completions when LiteLLM is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/v1/chat/completions", json={
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_v1_models(mock_get_client, test_client):
+    """Test /v1/models pass-through."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "data": [
+            {"id": "gpt-4o", "object": "model", "created": 1234567890},
+        ]
+    }
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["data"]) == 1
+    assert data["data"][0]["id"] == "gpt-4o"
+
+    mock_client.get.assert_called_once_with("/v1/models")
+
+
+@patch("app.main.get_http_client")
+def test_v1_models_backend_unavailable(mock_get_client, test_client):
+    """Test /v1/models when LiteLLM is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.get("/v1/models")
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
+
+
+@patch("app.main.get_http_client")
+def test_v1_embeddings(mock_get_client, test_client):
+    """Test /v1/embeddings pass-through."""
+    mock_client = AsyncMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
+        "usage": {"prompt_tokens": 3},
+    }
+    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/v1/embeddings", json={
+        "model": "text-embedding-3-small",
+        "input": "Hello world",
+    })
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["data"][0]["embedding"] == [0.1, 0.2, 0.3]
+
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    assert call_kwargs[0][0] == "/v1/embeddings"
+
+
+@patch("app.main.get_http_client")
+def test_v1_embeddings_backend_unavailable(mock_get_client, test_client):
+    """Test /v1/embeddings when LiteLLM is unreachable."""
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_get_client.return_value = mock_client
+
+    response = test_client.post("/v1/embeddings", json={
+        "model": "text-embedding-3-small",
+        "input": "Hello",
+    })
+
+    assert response.status_code == 502
+    assert "Backend proxy unavailable" in response.json()["detail"]
