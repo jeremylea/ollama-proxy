@@ -43,8 +43,11 @@ MODEL_METADATA: Dict[str, Any] = {}
 
 
 def load_model_metadata() -> None:
-    """Load model metadata from config.yaml (or config.example.yaml as fallback)."""
-    global MODEL_METADATA
+    """Load model metadata from config.yaml (or config.example.yaml as fallback).
+
+    Mutates MODEL_METADATA in-place so that modules which already imported it
+    (e.g. app.main) see the updated contents.
+    """
     base_dir = os.path.dirname(os.path.dirname(__file__))
     config_path = os.path.join(base_dir, "config.yaml")
     example_path = os.path.join(base_dir, "config.example.yaml")
@@ -58,13 +61,14 @@ def load_model_metadata() -> None:
             logger.warning(
                 "Neither config.yaml nor config.example.yaml found in %s", base_dir
             )
-            MODEL_METADATA = {}
+            MODEL_METADATA.clear()
             return
 
     try:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        MODEL_METADATA = config.get("models", {}) if config else {}
+        MODEL_METADATA.clear()
+        MODEL_METADATA.update(config.get("models", {}) if config else {})
         logger.info(
             "Loaded metadata for %d models from %s",
             len(MODEL_METADATA),
@@ -72,7 +76,7 @@ def load_model_metadata() -> None:
         )
     except Exception as e:
         logger.error("Failed to load %s: %s", os.path.basename(config_path), e)
-        MODEL_METADATA = {}
+        MODEL_METADATA.clear()
 
 
 def setup_logging() -> None:
