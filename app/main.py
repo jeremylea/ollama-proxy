@@ -852,6 +852,17 @@ async def push_model(request: PushModelRequest):
 # We forward them directly to LiteLLM since it already speaks OpenAI format.
 
 
+def _strip_model_tag(model_name: str) -> str:
+    """Strip Ollama-style ``:tag`` suffix from a model name.
+
+    Copilot reads model names from ``/api/tags`` (e.g. ``qwen36-27b:latest``)
+    and sends them back. LiteLLM expects the bare model ID.
+    """
+    if ":" in model_name:
+        return model_name.rsplit(":", 1)[0]
+    return model_name
+
+
 async def _proxy_post(
     path: str, body: Dict[str, Any], stream: bool
 ) -> Union[StreamingResponse, JSONResponse]:
@@ -918,6 +929,9 @@ async def v1_chat_completions(request: Request):
     """
     body: Dict[str, Any] = await request.json()
     stream = body.get("stream", False)
+    # Strip Ollama-style :tag suffix for LiteLLM
+    if "model" in body:
+        body["model"] = _strip_model_tag(body["model"])
     logger.info("v1/chat/completions: model=%s, stream=%s", body.get("model"), stream)
     return await _proxy_post("/v1/chat/completions", body, stream)
 
@@ -939,5 +953,8 @@ async def v1_embeddings(request: Request):
     Forwards the request directly to LiteLLM's /v1/embeddings.
     """
     body: Dict[str, Any] = await request.json()
+    # Strip Ollama-style :tag suffix for LiteLLM
+    if "model" in body:
+        body["model"] = _strip_model_tag(body["model"])
     logger.info("v1/embeddings: model=%s", body.get("model"))
     return await _proxy_post("/v1/embeddings", body, stream=False)
