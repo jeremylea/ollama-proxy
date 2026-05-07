@@ -388,6 +388,14 @@ def _infer_parameter_size(
     # Fallback: derive from num_parameters in config
     num_params = config.get("num_parameters")
     if num_params and isinstance(num_params, int):
+        # For MoE models, report active parameters instead of total.
+        # num_experts * num_experts_active gives the sparsity factor.
+        num_experts = config.get("num_experts")
+        num_experts_active = config.get("num_experts_active")
+        if num_experts and num_experts_active:
+            # Active params ≈ total / num_experts * num_experts_active
+            active = int(num_params / num_experts * num_experts_active)
+            return _format_param_size(active)
         return _format_param_size(num_params)
 
     return None

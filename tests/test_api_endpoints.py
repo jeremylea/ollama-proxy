@@ -364,7 +364,7 @@ def test_embed_backend_unavailable(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_chat_completions_non_streaming(mock_get_client, test_client):
     """Test /v1/chat/completions pass-through with stream=false."""
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
@@ -398,7 +398,7 @@ def test_v1_chat_completions_non_streaming(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_chat_completions_streaming(mock_get_client, test_client):
     """Test /v1/chat/completions pass-through with stream=true."""
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
 
@@ -427,8 +427,8 @@ def test_v1_chat_completions_streaming(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_chat_completions_backend_unavailable(mock_get_client, test_client):
     """Test /v1/chat/completions when LiteLLM is unreachable."""
-    mock_client = AsyncMock()
-    mock_client.send.side_effect = ConnectError("Connection refused")
+    mock_client = MagicMock()
+    mock_client.send = AsyncMock(side_effect=ConnectError("Connection refused"))
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/chat/completions", json={
@@ -443,7 +443,7 @@ def test_v1_chat_completions_backend_unavailable(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_models(mock_get_client, test_client):
     """Test /v1/models pass-through."""
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
@@ -467,8 +467,8 @@ def test_v1_models(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_models_backend_unavailable(mock_get_client, test_client):
     """Test /v1/models when LiteLLM is unreachable."""
-    mock_client = AsyncMock()
-    mock_client.get.side_effect = ConnectError("Connection refused")
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(side_effect=ConnectError("Connection refused"))
     mock_get_client.return_value = mock_client
 
     response = test_client.get("/v1/models")
@@ -480,7 +480,7 @@ def test_v1_models_backend_unavailable(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_embeddings(mock_get_client, test_client):
     """Test /v1/embeddings pass-through."""
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
@@ -505,8 +505,8 @@ def test_v1_embeddings(mock_get_client, test_client):
 @patch("app.main.get_http_client")
 def test_v1_embeddings_backend_unavailable(mock_get_client, test_client):
     """Test /v1/embeddings when LiteLLM is unreachable."""
-    mock_client = AsyncMock()
-    mock_client.send.side_effect = ConnectError("Connection refused")
+    mock_client = MagicMock()
+    mock_client.send = AsyncMock(side_effect=ConnectError("Connection refused"))
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/embeddings", json={
