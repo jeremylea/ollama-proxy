@@ -6,8 +6,10 @@ Model metadata is loaded from config.yaml at startup, then optionally
 enriched with information from the Hugging Face API.
 """
 
+import asyncio
 import os
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -20,12 +22,39 @@ logger = logging.getLogger(__name__)
 
 # Hugging Face API base URL
 HF_API_BASE = os.getenv("HF_API_BASE", "https://huggingface.co/api/models")
+# Raw file base (for fetching tokenizer_config.json etc.)
+HF_RAW_BASE = os.getenv("HF_RAW_BASE", "https://huggingface.co")
 
 # Timeout for individual Hugging Face API requests (seconds)
 HF_REQUEST_TIMEOUT = float(os.getenv("HF_REQUEST_TIMEOUT", "10.0"))
 
 # Disable HF metadata enrichment (set to "0" or "false" to skip)
 HF_METADATA_ENABLED = os.getenv("HF_METADATA_ENABLED", "1").lower() not in ("0", "false", "off")
+
+# Known model family patterns for inference from HF model ID / tags
+_FAMILY_PATTERNS: List[tuple[str, str]] = [
+    (r"qwen", "qwen2"),
+    (r"llama", "llama"),
+    (r"mistral|mixtral", "mistral"),
+    (r"gemma", "gemma2"),
+    (r"phi", "phi"),
+    (r"deepseek", "deepseek"),
+    (r"command", "command-r"),
+    (r"falcon", "falcon"),
+    (r"yi\b", "yi"),
+    (r"internlm", "internlm"),
+]
+
+# Known stop tokens by family (fallback when tokenizer_config lacks them)
+_FAMILY_STOP_TOKENS: Dict[str, List[str]] = {
+    "qwen2": ["<|im_start|>", "<|im_end|>"],
+    "llama": ["<|eot_id|>", "<|end_of_text|>"],
+    "mistral": ["</s>", "[/INST]"],
+    "gemma2": ["<end_of_turn>", "<eos>"],
+    "phi": ["<|end|>"],
+    "deepseek": ["<|end_of_sentence|>"],
+    "command-r": ["<|END_OF_TURN_TOKEN|>"],
+}
 
 
 class Settings:
@@ -47,7 +76,7 @@ class Settings:
     VERSION: str = "0.6.4"
 
 
-settings = Settings
+settings = Settings()
 
 # Model metadata loaded from config.yaml
 MODEL_METADATA: Dict[str, Any] = {}
@@ -66,7 +95,6 @@ def load_model_metadata() -> None:
     config_path = os.path.join(base_dir, "config.yaml")
     example_path = os.path.join(base_dir, "config.example.yaml")
 
-    # Use config.yaml if it exists, otherwise fall back to config.example.yaml
     if not os.path.exists(config_path):
         if os.path.exists(example_path):
             config_path = example_path
@@ -100,25 +128,13 @@ async def enrich_model_metadata_from_hf(
     """Enrich MODEL_METADATA with information from the Hugging Face API.
 
     For each model entry in MODEL_METADATA, this function resolves a Hugging
-    Face model ID using the following priority:
+    Face model ID and fetches:
 
-      1. Explicit ``hf_id`` in config.yaml (override)
-      2. Derived from LiteLLM model info (strip ``openai/`` prefix)
+      - Main model metadata (``/api/models/<hf_id>``)
+      - ``tokenizer_config.json`` for chat_template and stop tokens
+      - ``config.json`` for architecture details and context length
 
-    It then attempts to fetch metadata from
-    ``https://huggingface.co/api/models/<hf_id>``.  On success, selected
-    fields (size, family, parameter_size, context_length, quantization_level,
-    model_info) are merged into the existing entry, with the YAML values
-    acting as fallback when the API field is missing.
-
-    Failures (network errors, 404, timeouts, malformed responses) are logged
-    at WARNING level and the model falls back to its YAML-only metadata.
-
-    Parameters
-    ----------
-    litellm_client :
-        The shared HTTP client configured for the LiteLLM proxy (used to
-        look up model info for deriving ``hf_id``).
+    Failures are logged at WARNING level; models fall back to YAML-only metadata.
     """
     if not HF_METADATA_ENABLED:
         logger.info("Hugging Face metadata enrichment disabled (HF_METADATA_ENABLED=0)")
@@ -128,7 +144,6 @@ async def enrich_model_metadata_from_hf(
         logger.debug("No models loaded from YAML — skipping HF enrichment")
         return
 
-    # Step 1: Resolve hf_id for each model
     models_with_hf: Dict[str, str] = {}
     for model_name, meta in MODEL_METADATA.items():
         hf_id = await _resolve_hf_id(model_name, meta, litellm_client)
@@ -145,10 +160,13 @@ async def enrich_model_metadata_from_hf(
         ", ".join(sorted(models_with_hf.keys())),
     )
 
-    # Step 2: Fetch from Hugging Face API
     async with httpx.AsyncClient(timeout=HF_REQUEST_TIMEOUT) as hf_client:
-        for model_name, hf_id in models_with_hf.items():
-            await _enrich_single_model(hf_client, model_name, hf_id)
+        tasks = [
+            _enrich_single_model(hf_client, model_name, hf_id)
+            for model_name, hf_id in models_with_hf.items()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
 
 
 async def _resolve_hf_id(
@@ -156,13 +174,7 @@ async def _resolve_hf_id(
     meta: Dict[str, Any],
     litellm_client: httpx.AsyncClient,
 ) -> Optional[str]:
-    """Resolve the Hugging Face model ID for a given model.
-
-    Priority:
-      1. Explicit ``hf_id`` in YAML config (override)
-      2. Derived from LiteLLM model info (strip ``openai/`` prefix)
-    """
-    # 1. Explicit override in config.yaml
+    """Resolve the Hugging Face model ID for a given model."""
     explicit_hf_id = meta.get("hf_id")
     if explicit_hf_id:
         logger.info(
@@ -172,7 +184,6 @@ async def _resolve_hf_id(
         )
         return explicit_hf_id
 
-    # 2. Derive from LiteLLM model info
     model_key = await _get_litellm_model_key(litellm_client, model_name)
     if model_key:
         hf_id = model_key.removeprefix("openai/")
@@ -191,11 +202,7 @@ async def _resolve_hf_id(
 async def _get_litellm_model_key(
     client: httpx.AsyncClient, model_name: str
 ) -> Optional[str]:
-    """Look up the underlying model key from LiteLLM's model info endpoint.
-
-    Returns the model key (e.g. ``openai/Qwen/Qwen3-Coder-480B-A35B-Instruct``)
-    or ``None`` on failure.
-    """
+    """Look up the underlying model key from LiteLLM's model info endpoint."""
     try:
         response = await client.get("/v1/model/info", params={"model": model_name})
     except (httpx.NetworkError, httpx.TimeoutException) as e:
@@ -213,8 +220,6 @@ async def _get_litellm_model_key(
     except Exception:
         return None
 
-    # LiteLLM returns {"data": [{"model_info": {"key": "openai/..."}}]}
-    # or {"data": [{"key": "openai/..."}]}
     items = data.get("data", [])
     if items and isinstance(items[0], dict):
         entry = items[0]
@@ -223,7 +228,6 @@ async def _get_litellm_model_key(
             key = model_info.get("key")
             if key:
                 return str(key)
-        # Fallback: key might be at the top level of the entry
         key = entry.get("key")
         if key:
             return str(key)
@@ -231,143 +235,160 @@ async def _get_litellm_model_key(
     return None
 
 
+async def _fetch_hf_json(
+    client: httpx.AsyncClient, url: str, label: str
+) -> Optional[Dict[str, Any]]:
+    """Fetch a JSON resource from Hugging Face, returning None on any failure."""
+    try:
+        response = await client.get(url)
+    except (httpx.NetworkError, httpx.TimeoutException) as e:
+        logger.debug("HF fetch failed for %s: %s", label, e)
+        return None
+
+    if response.status_code != 200:
+        logger.debug("HF fetch returned %d for %s", response.status_code, label)
+        return None
+
+    try:
+        return response.json()
+    except Exception as e:
+        logger.debug("Failed to parse HF JSON for %s: %s", label, e)
+        return None
+
+
 async def _enrich_single_model(
     client: httpx.AsyncClient, model_name: str, hf_id: str
 ) -> None:
-    """Fetch and merge metadata for a single model from Hugging Face."""
-    url = f"{HF_API_BASE}/{hf_id}"
-    try:
-        response = await client.get(url)
-    except httpx.NetworkError as e:
-        logger.warning(
-            "HF network error for %s (hf_id=%s): %s — falling back to YAML",
-            model_name,
-            hf_id,
-            e,
-        )
-        return
-    except httpx.TimeoutException as e:
-        logger.warning(
-            "HF timeout for %s (hf_id=%s): %s — falling back to YAML",
-            model_name,
-            hf_id,
-            e,
-        )
-        return
+    """Fetch and merge metadata for a single model from Hugging Face.
 
-    if response.status_code == 404:
+    Fetches three sources:
+      1. /api/models/<hf_id>         — tags, pipeline_tag, siblings list, size
+      2. resolve/main/config.json    — architecture, context_length, vocab_size
+      3. resolve/main/tokenizer_config.json — chat_template, stop tokens, eos_token
+    """
+    # 1. Main model API
+    api_url = f"{HF_API_BASE}/{hf_id}"
+    hf_data = await _fetch_hf_json(client, api_url, f"{model_name}/api")
+    if hf_data is None:
         logger.warning(
-            "HF model not found for %s (hf_id=%s) — falling back to YAML",
-            model_name,
-            hf_id,
-        )
-        return
-    if response.status_code != 200:
-        logger.warning(
-            "HF API returned %d for %s (hf_id=%s) — falling back to YAML",
-            response.status_code,
+            "HF API fetch failed for %s (hf_id=%s) — falling back to YAML",
             model_name,
             hf_id,
         )
         return
 
-    try:
-        hf_data = response.json()
-    except Exception as e:
-        logger.warning(
-            "Failed to parse HF response for %s (hf_id=%s): %s — falling back to YAML",
-            model_name,
-            hf_id,
-            e,
-        )
-        return
+    # 2. config.json (architecture details)
+    config_url = f"{HF_RAW_BASE}/{hf_id}/resolve/main/config.json"
+    hf_config = await _fetch_hf_json(client, config_url, f"{model_name}/config.json") or {}
+
+    # 3. tokenizer_config.json (chat template, stop tokens)
+    tok_url = f"{HF_RAW_BASE}/{hf_id}/resolve/main/tokenizer_config.json"
+    hf_tok_config = await _fetch_hf_json(client, tok_url, f"{model_name}/tokenizer_config.json") or {}
 
     meta = MODEL_METADATA[model_name]
-
-    # Map HF fields into our metadata structure
-    hf_size = hf_data.get("size")
-    hf_pipeline_tag = hf_data.get("pipeline_tag")
-    hf_config = hf_data.get("config", {}) or {}
-    hf_tags = hf_data.get("tags", [])
+    hf_tags = hf_data.get("tags", []) or []
     hf_card_data = hf_data.get("cardData", {}) or {}
 
-    # --- size (model weight file size in bytes) ---
+    # --- size ---
+    hf_size = hf_data.get("size")
     if hf_size is not None:
         meta.setdefault("size", hf_size)
-        logger.debug("  %s: size <- %d (HF)", model_name, hf_size)
 
-    # --- family (inferred from pipeline_tag or tags) ---
-    if "family" not in meta or not meta["family"]:
-        family = _infer_family_from_hf(hf_pipeline_tag, hf_tags)
+    # --- family ---
+    if not meta.get("family"):
+        family = _infer_family(hf_id, hf_data.get("pipeline_tag"), hf_tags)
         if family:
             meta["family"] = family
-            logger.debug("  %s: family <- %r (HF)", model_name, family)
+            logger.debug("  %s: family <- %r", model_name, family)
 
-    # --- parameter_size (from cardData or config) ---
-    if "parameter_size" not in meta or not meta["parameter_size"]:
-        param_size = _infer_parameter_size(hf_card_data, hf_config)
+    # --- parameter_size ---
+    if not meta.get("parameter_size"):
+        param_size = _infer_parameter_size(hf_id, hf_card_data, hf_config)
         if param_size:
             meta["parameter_size"] = param_size
-            logger.debug("  %s: parameter_size <- %r (HF)", model_name, param_size)
+            logger.debug("  %s: parameter_size <- %r", model_name, param_size)
 
     # --- context_length ---
-    if "context_length" not in meta or not meta["context_length"]:
-        ctx_len = _infer_context_length(hf_config)
+    if not meta.get("context_length"):
+        ctx_len = _infer_context_length(hf_config, hf_tok_config)
         if ctx_len is not None:
             meta["context_length"] = ctx_len
-            logger.debug("  %s: context_length <- %d (HF)", model_name, ctx_len)
+            logger.debug("  %s: context_length <- %d", model_name, ctx_len)
 
-    # --- quantization_level (from tags) ---
-    if "quantization_level" not in meta or not meta["quantization_level"]:
+    # --- quantization_level ---
+    if not meta.get("quantization_level"):
         quant = _infer_quantization(hf_tags)
         if quant:
             meta["quantization_level"] = quant
-            logger.debug("  %s: quantization_level <- %r (HF)", model_name, quant)
+            logger.debug("  %s: quantization_level <- %r", model_name, quant)
 
-    # --- model_info (rich key-value from HF) ---
-    if "model_info" not in meta or not meta["model_info"]:
-        model_info = _build_model_info(hf_data, hf_config, hf_card_data)
+    # --- chat template (from tokenizer_config.json) ---
+    if not meta.get("template"):
+        template = _extract_chat_template(hf_tok_config)
+        if template:
+            meta["template"] = template
+            logger.debug("  %s: template extracted from tokenizer_config.json", model_name)
+
+    # --- stop tokens ---
+    if not meta.get("stop_tokens"):
+        stop_tokens = _extract_stop_tokens(hf_tok_config, meta.get("family"))
+        if stop_tokens:
+            meta["stop_tokens"] = stop_tokens
+            logger.debug("  %s: stop_tokens <- %r", model_name, stop_tokens)
+
+    # --- model_info (rich key-value for api/show) ---
+    if not meta.get("model_info"):
+        model_info = _build_model_info(hf_data, hf_config, hf_tok_config, hf_card_data)
         if model_info:
             meta["model_info"] = model_info
 
     logger.info("Enriched metadata for %s from Hugging Face (hf_id=%s)", model_name, hf_id)
 
 
-def _infer_family_from_hf(
-    pipeline_tag: Optional[str], tags: List[str]
+# ---------------------------------------------------------------------------
+# Inference helpers
+# ---------------------------------------------------------------------------
+
+def _infer_family(
+    hf_id: str,
+    pipeline_tag: Optional[str],
+    tags: List[str],
 ) -> Optional[str]:
-    """Infer model family from Hugging Face pipeline_tag or tags."""
-    if pipeline_tag:
-        tag_lower = pipeline_tag.lower()
-        if "text-generation" in tag_lower:
-            # Try to infer from tags
-            tags_lower = [t.lower() for t in tags]
-            for keyword, family in [
-                ("llama", "llama"),
-                ("mistral", "mistral"),
-                ("qwen", "qwen2"),
-                ("gemma", "gemma2"),
-                ("phi", "phi"),
-            ]:
-                if any(keyword in t for t in tags_lower):
-                    return family
-            return "unknown"
+    """Infer model family from hf_id, pipeline_tag, or tags."""
+    search_text = " ".join([hf_id.lower()] + [t.lower() for t in tags])
+    for pattern, family in _FAMILY_PATTERNS:
+        if re.search(pattern, search_text):
+            return family
     return None
 
 
 def _infer_parameter_size(
-    card_data: Dict[str, Any], config: Dict[str, Any]
+    hf_id: str,
+    card_data: Dict[str, Any],
+    config: Dict[str, Any],
 ) -> Optional[str]:
-    """Infer parameter size string from Hugging Face cardData or config."""
-    # Try cardData first (model_name, library_name often hint size)
-    param_count = card_data.get("tokenizer_config", {}).get("max_position_embeddings")
-    if param_count:
-        return _format_param_size(param_count)
+    """Infer parameter size from hf_id pattern, cardData, or config."""
+    # Most HF model IDs encode size directly, e.g. "Qwen3-Coder-480B-A35B" or "27B"
+    # Match patterns like 480B, 27B, 7B, 235B, 1.5B, 0.5B, 72B
+    # If there's an A-suffix (MoE active params), prefer the total
+    # e.g. "480B-A35B" → "480B"
+    total = re.search(r"(\d+(?:\.\d+)?)[Bb]-[Aa]\d", hf_id)
+    if total:
+        return total.group(1) + "B"
+    match = re.search(r"(\d+(?:\.\d+)?)[Bb]", hf_id)
+    if match:
+        return match.group(1) + "B"
 
-    # Try config.torch_dtype or config.vocab_size as hints
-    torch_dtype = config.get("torch_dtype", "")
-    if torch_dtype:
-        return torch_dtype.replace("torch.", "")
+    # cardData model_name sometimes has it
+    card_name = card_data.get("model_name", "")
+    match = re.search(r"(\d+(?:\.\d+)?)[Bb]", str(card_name))
+    if match:
+        return match.group(0).upper()
+
+    # Fallback: derive from num_parameters in config
+    num_params = config.get("num_parameters")
+    if num_params and isinstance(num_params, int):
+        return _format_param_size(num_params)
 
     return None
 
@@ -375,26 +396,35 @@ def _infer_parameter_size(
 def _format_param_size(count: int) -> str:
     """Format a parameter count into a human-readable string like '7B'."""
     if count >= 1_000_000_000_000:
-        return f"{count // 1_000_000_000_000}T"
+        return f"{count / 1_000_000_000_000:.0f}T"
     if count >= 1_000_000_000:
-        return f"{count // 1_000_000_000}B"
+        return f"{count / 1_000_000_000:.0f}B"
     if count >= 1_000_000:
-        return f"{count // 1_000_000}M"
+        return f"{count / 1_000_000:.0f}M"
     return str(count)
 
 
-def _infer_context_length(config: Dict[str, Any]) -> Optional[int]:
-    """Infer context length from Hugging Face model config."""
-    # Common keys across architectures
+def _infer_context_length(
+    config: Dict[str, Any],
+    tok_config: Dict[str, Any],
+) -> Optional[int]:
+    """Infer context length from config.json or tokenizer_config.json."""
     for key in (
         "max_position_embeddings",
         "context_length",
         "n_ctx",
         "max_sequence_length",
+        "seq_length",
     ):
         val = config.get(key)
-        if val and isinstance(val, int):
+        if val and isinstance(val, int) and val > 512:
             return val
+
+    # tokenizer_config sometimes has model_max_length
+    val = tok_config.get("model_max_length")
+    if val and isinstance(val, int) and val > 512 and val < 10_000_000:
+        return val
+
     return None
 
 
@@ -404,40 +434,182 @@ def _infer_quantization(tags: List[str]) -> Optional[str]:
     for quant in (
         "fp8", "fp4", "nf4",
         "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "q3_k", "q2_k",
-        "int8", "int4",
+        "int8", "int4", "awq", "gptq",
     ):
         if any(quant in t for t in tags_lower):
             return quant.upper()
     return None
 
 
+def _extract_chat_template(tok_config: Dict[str, Any]) -> Optional[str]:
+    """Extract and convert the Jinja chat template into an Ollama-style Go template.
+
+    tokenizer_config.json stores the template as a Jinja2 string (or a dict of
+    named templates).  Ollama uses Go templates, but most clients that read
+    api/show just want to see *something* here for format detection — the actual
+    rendering is done server-side by vLLM/LiteLLM.  We store the raw Jinja
+    string under ``jinja_template`` and derive a simplified Go template for
+    ``template`` that correctly reflects the token format (ChatML vs Llama3 etc.).
+    """
+    raw = tok_config.get("chat_template")
+    if not raw:
+        return None
+
+    # If it's a dict of named templates, prefer "default" or the first entry
+    if isinstance(raw, dict):
+        raw = raw.get("default") or next(iter(raw.values()), None)
+    if not raw or not isinstance(raw, str):
+        return None
+
+    # Detect format from the Jinja template content and map to a Go template.
+    if "▌" in raw:
+        # ChatML format (Qwen, many others)
+        return (
+            "{{ if .System }}▌system\n{{ .System }}\n▌user\n{{ end }}"
+            "{{ range .Messages }}▌{{ .Role }}\n{{ .Content }}\n▌assistant\n{{ end }}"
+        )
+    if "<|start_header_id|>" in raw:
+        # Llama-3 format
+        return (
+            "{{ if .System }}<|start_header_id|>system<|end_header_id|>\n\n"
+            "{{ .System }}<|eot_id|>{{ end }}"
+            "{{ range .Messages }}<|start_header_id|>{{ .Role }}<|end_header_id|>\n\n"
+            "{{ .Content }}<|eot_id|>{{ end }}"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+    if "[INST]" in raw:
+        # Mistral/Llama-2 format
+        return (
+            "{{ if .System }}[INST] {{ .System }} [/INST]\n{{ end }}"
+            "{{ range .Messages }}{{ if eq .Role \"user\" }}[INST] {{ .Content }} [/INST]\n"
+            "{{ else }}{{ .Content }}\n{{ end }}{{ end }}"
+        )
+    if "<|user|>" in raw:
+        # Phi-3 / Zephyr format
+        return (
+            "{{ if .System }}<|system|>\n{{ .System }}<|end|>\n{{ end }}"
+            "{{ range .Messages }}<|{{ .Role }}|>\n{{ .Content }}<|end|>\n{{ end }}"
+            "<|assistant|>\n"
+        )
+    if "<start_of_turn>" in raw:
+        # Gemma format
+        return (
+            "{{ range .Messages }}<start_of_turn>{{ .Role }}\n"
+            "{{ .Content }}<end_of_turn>\n{{ end }}"
+            "<start_of_turn>model\n"
+        )
+
+    # Unknown format — return a generic placeholder so callers know a template exists
+    return "{{ range .Messages }}{{ .Role }}: {{ .Content }}\n{{ end }}"
+
+
+def _extract_stop_tokens(
+    tok_config: Dict[str, Any],
+    family: Optional[str],
+) -> List[str]:
+    """Extract stop/EOS tokens from tokenizer_config.json.
+
+    Checks eos_token, added_tokens_decoder for common stop token patterns,
+    and falls back to known per-family defaults.
+    """
+    stop: List[str] = []
+
+    eos = tok_config.get("eos_token")
+    if isinstance(eos, str) and eos:
+        stop.append(eos)
+    elif isinstance(eos, dict):
+        content = eos.get("content")
+        if content:
+            stop.append(content)
+
+    # additional_special_tokens sometimes lists stop tokens explicitly
+    for tok in tok_config.get("additional_special_tokens", []):
+        if isinstance(tok, str) and any(
+            kw in tok.lower()
+            for kw in ("end", "eos", "stop", "eot", "im_end", "eot_id")
+        ):
+            if tok not in stop:
+                stop.append(tok)
+
+    # Fallback to family defaults if we found nothing useful
+    if not stop and family:
+        stop = _FAMILY_STOP_TOKENS.get(family, [])
+
+    return stop
+
+
 def _build_model_info(
     hf_data: Dict[str, Any],
     config: Dict[str, Any],
+    tok_config: Dict[str, Any],
     card_data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Build a model_info dict from Hugging Face response data."""
+    """Build a model_info dict from all available Hugging Face data.
+
+    Uses architecture-namespaced keys mirroring the GGUF convention that
+    Ollama's api/show response uses (e.g. ``qwen2.context_length``).
+    """
     info: Dict[str, Any] = {}
 
-    # Basic model info
+    # Determine architecture prefix from config.json
+    arch = config.get("model_type", "")
+    # Normalise: "qwen2_moe" -> "qwen2", "llama" -> "llama" etc.
+    arch_prefix = re.sub(r"[_-]moe$|[_-]vl$|[_-]audio$", "", arch).lower() if arch else ""
+
+    # General fields
     if hf_data.get("id"):
         info["general.name"] = hf_data["id"]
-    if hf_data.get("likes"):
-        info["general.likes"] = hf_data["likes"]
-    if hf_data.get("downloads"):
-        info["general.downloads"] = hf_data["downloads"]
     if hf_data.get("pipeline_tag"):
         info["general.pipeline_tag"] = hf_data["pipeline_tag"]
-    if hf_data.get("size"):
-        info["general.size"] = hf_data["size"]
 
-    # Config details
-    for key in ("vocab_size", "hidden_size", "intermediate_size",
-                 "num_hidden_layers", "num_attention_heads",
-                 "max_position_embeddings", "torch_dtype"):
-        val = config.get(key)
-        if val is not None:
-            info[f"config.{key}"] = val
+    # Architecture-namespaced context / embedding dims
+    ctx_len = _infer_context_length(config, tok_config)
+    if ctx_len and arch_prefix:
+        info[f"{arch_prefix}.context_length"] = ctx_len
+
+    for src_key, dst_suffix in (
+        ("hidden_size", "embedding_length"),
+        ("num_hidden_layers", "block_count"),
+        ("num_attention_heads", "attention.head_count"),
+        ("num_key_value_heads", "attention.head_count_kv"),
+        ("intermediate_size", "feed_forward_length"),
+        ("vocab_size", "vocab_size"),
+    ):
+        val = config.get(src_key)
+        if val is not None and arch_prefix:
+            info[f"{arch_prefix}.{dst_suffix}"] = val
+        elif val is not None:
+            info[f"config.{src_key}"] = val
+
+    # Parameter count
+    num_params = config.get("num_parameters")
+    if num_params:
+        info["general.parameter_count"] = num_params
+
+    # Torch dtype
+    dtype = config.get("torch_dtype")
+    if dtype:
+        info["general.file_type"] = dtype
+
+    # Raw Jinja template stored for reference (not used by Ollama directly)
+    raw_template = tok_config.get("chat_template")
+    if isinstance(raw_template, str) and raw_template:
+        info["tokenizer.chat_template"] = raw_template
+    elif isinstance(raw_template, dict):
+        # Store the default variant
+        default = raw_template.get("default") or next(iter(raw_template.values()), None)
+        if default:
+            info["tokenizer.chat_template"] = default
+
+    # EOS / BOS tokens
+    for key in ("eos_token", "bos_token", "pad_token"):
+        val = tok_config.get(key)
+        if isinstance(val, str) and val:
+            info[f"tokenizer.{key}"] = val
+        elif isinstance(val, dict):
+            content = val.get("content")
+            if content:
+                info[f"tokenizer.{key}"] = content
 
     return info if info else None
 
@@ -454,17 +626,6 @@ def setup_logging() -> None:
 async def initialize_model_metadata(
     litellm_client: httpx.AsyncClient,
 ) -> None:
-    """Load model metadata from YAML and enrich with Hugging Face API data.
-
-    This is the main entry point called from the app lifespan handler.
-    It first loads the YAML configuration, then attempts to enrich each
-    model with data from Hugging Face.
-
-    Parameters
-    ----------
-    litellm_client :
-        The shared HTTP client configured for the LiteLLM proxy (used to
-        look up model info for deriving ``hf_id``).
-    """
+    """Load model metadata from YAML and enrich with Hugging Face API data."""
     load_model_metadata()
     await enrich_model_metadata_from_hf(litellm_client)
