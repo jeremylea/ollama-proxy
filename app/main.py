@@ -43,34 +43,43 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-# ── Global HTTP client (lazy-initialized) ───────────────────────────────────
+# ── Global HTTP client (initialized in lifespan) ────────────────────────────
 
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Return a shared async HTTP client for LiteLLM proxy calls."""
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if settings.LITELLM_API_KEY:
-            headers["Authorization"] = f"Bearer {settings.LITELLM_API_KEY}"
-        _http_client = httpx.AsyncClient(
-            base_url=settings.LITELLM_BASE_URL,
-            headers=headers,
-            timeout=httpx.Timeout(settings.HTTP_TIMEOUT, connect=10.0),
-        )
+    """Return the shared async HTTP client for LiteLLM proxy calls.
+
+    The client is initialized once during app startup in the lifespan handler,
+    so this function simply returns the pre-created instance.
+    """
+    assert _http_client is not None and not _http_client.is_closed, (
+        "HTTP client not initialized — call outside of app lifespan?"
+    )
     return _http_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
+    global _http_client
     setup_logging()
     logger.info("Starting Ollama API proxy")
     logger.info("LiteLLM base URL: %s", settings.LITELLM_BASE_URL)
+
+    # Initialize the shared HTTP client once before serving traffic
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if settings.LITELLM_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.LITELLM_API_KEY}"
+    _http_client = httpx.AsyncClient(
+        base_url=settings.LITELLM_BASE_URL,
+        headers=headers,
+        timeout=httpx.Timeout(settings.HTTP_TIMEOUT, connect=10.0),
+    )
+
     yield
-    global _http_client
+
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()
         logger.info("HTTP client closed")
@@ -126,13 +135,15 @@ def map_options_to_openai(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {}
     for ollama_key, openai_key in param_map.items():
-        if ollama_key in options:
+        if ollama_key in options and options[ollama_key] is not None and result.get(openai_key) is None:
             result[openai_key] = options[ollama_key]
 
     # Pass through any extra options that might be understood by LiteLLM
     for key, value in options.items():
         if key not in param_map and key not in ignored_keys:
             result[key] = value
+        elif key in ignored_keys:
+            logger.debug("Ignoring unsupported Ollama option: %s", key)
 
     return result
 
@@ -167,7 +178,7 @@ def build_openai_messages_chat(
             entry["content"] = content_list
         else:
             entry["content"] = msg.content
-            
+
         if msg.tool_calls:
             entry["tool_calls"] = msg.tool_calls
         result.append(entry)
@@ -240,80 +251,75 @@ async def stream_generate_transform(
     """Transform OpenAI SSE stream into Ollama generate SSE format."""
     created_at = now_iso()
     start_time = time.monotonic()
-    prompt_tokens = 0
-    completion_tokens = 0
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     final_usage: Optional[Dict[str, Any]] = None
 
-    async for line in response.aiter_lines():
-        line = line.strip()
-        if not line:
-            continue
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str == "[DONE]":
-            # Emit final chunk
-            elapsed_ns = int((time.monotonic() - start_time) * 1e9)
-            chunk = {
-                "model": model,
-                "created_at": created_at,
-                "response": "",
-                "done": True,
-                "done_reason": "stop",
-                "total_duration": elapsed_ns,
-                "load_duration": 0,
-                "prompt_eval_count": prompt_tokens,
-                "eval_count": completion_tokens,
-            }
-            if final_usage:
-                usage_tokens = final_usage.get("prompt_tokens")
-                if usage_tokens:
-                    chunk["prompt_eval_count"] = usage_tokens
-                comp_tokens = final_usage.get("completion_tokens")
-                if comp_tokens:
-                    chunk["eval_count"] = comp_tokens
-            yield json.dumps(chunk) + "\n"
-            return
+    try:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                # Emit final chunk
+                elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+                chunk = {
+                    "model": model,
+                    "created_at": created_at,
+                    "response": "",
+                    "done": True,
+                    "done_reason": "stop",
+                    "total_duration": elapsed_ns,
+                    "load_duration": 0,
+                    "prompt_eval_count": prompt_tokens,
+                    "eval_count": completion_tokens,
+                }
+                yield json.dumps(chunk) + "\n"
+                return
 
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-        # Capture usage from the final data chunk
-        if "usage" in data:
-            final_usage = data["usage"]
-            prompt_tokens = data["usage"].get("prompt_tokens", 0)
-            completion_tokens = data["usage"].get("completion_tokens", 0)
+            # Capture usage only once from OpenAI's final chunk
+            if "usage" in data:
+                final_usage = data["usage"]
+                prompt_tokens = data["usage"].get("prompt_tokens")
+                completion_tokens = data["usage"].get("completion_tokens")
 
-        choices = data.get("choices")
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = choice.get("delta", {})
-        content = delta.get("content")
-        if content:
-            completion_tokens += len(content.split())
-            yield json.dumps({
-                "model": model,
-                "created_at": created_at,
-                "response": content,
-                "done": False,
-            }) + "\n"
+            choices = data.get("choices")
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content")
+            if content:
+                yield json.dumps({
+                    "model": model,
+                    "created_at": created_at,
+                    "response": content,
+                    "done": False,
+                }) + "\n"
 
-    # Fallback final chunk if [DONE] was not received
-    elapsed_ns = int((time.monotonic() - start_time) * 1e9)
-    yield json.dumps({
-        "model": model,
-        "created_at": created_at,
-        "response": "",
-        "done": True,
-        "done_reason": "stop",
-        "total_duration": elapsed_ns,
-        "load_duration": 0,
-        "prompt_eval_count": prompt_tokens,
-        "eval_count": completion_tokens,
-    }) + "\n"
+        # Fallback final chunk if [DONE] was not received
+        elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+        yield json.dumps({
+            "model": model,
+            "created_at": created_at,
+            "response": "",
+            "done": True,
+            "done_reason": "stop",
+            "total_duration": elapsed_ns,
+            "load_duration": 0,
+            "prompt_eval_count": prompt_tokens,
+            "eval_count": completion_tokens,
+        }) + "\n"
+    finally:
+        await response.aclose()
 
 
 async def stream_chat_transform(
@@ -324,93 +330,87 @@ async def stream_chat_transform(
     """Transform OpenAI SSE stream into Ollama chat SSE format."""
     created_at = now_iso()
     start_time = time.monotonic()
-    prompt_tokens = 0
-    completion_tokens = 0
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     final_usage: Optional[Dict[str, Any]] = None
     finish_reason: Optional[str] = None
 
-    async for line in response.aiter_lines():
-        line = line.strip()
-        if not line:
-            continue
-        if not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str == "[DONE]":
-            # Emit final chunk
-            elapsed_ns = int((time.monotonic() - start_time) * 1e9)
-            chunk: Dict[str, Any] = {
-                "model": model,
-                "created_at": created_at,
-                "message": {"role": "assistant", "content": ""},
-                "done": True,
-                "done_reason": finish_reason or "stop",
-                "total_duration": elapsed_ns,
-                "load_duration": 0,
-                "prompt_eval_count": prompt_tokens,
-                "eval_count": completion_tokens,
-            }
-            if final_usage:
-                usage_tokens = final_usage.get("prompt_tokens")
-                if usage_tokens:
-                    chunk["prompt_eval_count"] = usage_tokens
-                comp_tokens = final_usage.get("completion_tokens")
-                if comp_tokens:
-                    chunk["eval_count"] = comp_tokens
-            yield json.dumps(chunk) + "\n"
-            return
+    try:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                # Emit final chunk
+                elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+                chunk: Dict[str, Any] = {
+                    "model": model,
+                    "created_at": created_at,
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": finish_reason or "stop",
+                    "total_duration": elapsed_ns,
+                    "load_duration": 0,
+                    "prompt_eval_count": prompt_tokens,
+                    "eval_count": completion_tokens,
+                }
+                yield json.dumps(chunk) + "\n"
+                return
 
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-        # Capture usage
-        if "usage" in data:
-            final_usage = data["usage"]
-            prompt_tokens = data["usage"].get("prompt_tokens", 0)
-            completion_tokens = data["usage"].get("completion_tokens", 0)
+            # Capture usage from the authoritative backend response
+            if "usage" in data:
+                final_usage = data["usage"]
+                prompt_tokens = data["usage"].get("prompt_tokens")
+                completion_tokens = data["usage"].get("completion_tokens")
 
-        # Capture finish_reason
-        choices = data.get("choices")
-        if choices and choices[0].get("finish_reason"):
-            finish_reason = choices[0]["finish_reason"]
+            # Capture finish_reason
+            choices = data.get("choices")
+            if choices and choices[0].get("finish_reason"):
+                finish_reason = choices[0]["finish_reason"]
 
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = choice.get("delta", {})
-        content = delta.get("content", "")
-        role = delta.get("role", "assistant")
-        tool_calls = delta.get("tool_calls")
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            content = delta.get("content", "")
+            role = delta.get("role", "assistant")
+            tool_calls = delta.get("tool_calls")
 
-        message: Dict[str, Any] = {"role": role, "content": content}
-        if tool_calls:
-            message["tool_calls"] = tool_calls
+            message: Dict[str, Any] = {"role": role, "content": content}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
 
-        if content or tool_calls:
-            completion_tokens += len(content.split())
-            yield json.dumps({
-                "model": model,
-                "created_at": created_at,
-                "message": message,
-                "done": False,
-            }) + "\n"
+            if content or tool_calls:
+                yield json.dumps({
+                    "model": model,
+                    "created_at": created_at,
+                    "message": message,
+                    "done": False,
+                }) + "\n"
 
-    # Fallback final chunk
-    elapsed_ns = int((time.monotonic() - start_time) * 1e9)
-    yield json.dumps({
-        "model": model,
-        "created_at": created_at,
-        "message": {"role": "assistant", "content": ""},
-        "done": True,
-        "done_reason": finish_reason or "stop",
-        "total_duration": elapsed_ns,
-        "load_duration": 0,
-        "prompt_eval_count": prompt_tokens,
-        "eval_count": completion_tokens,
-    }) + "\n"
-
+        # Fallback final chunk
+        elapsed_ns = int((time.monotonic() - start_time) * 1e9)
+        yield json.dumps({
+            "model": model,
+            "created_at": created_at,
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": finish_reason or "stop",
+            "total_duration": elapsed_ns,
+            "load_duration": 0,
+            "prompt_eval_count": prompt_tokens,
+            "eval_count": completion_tokens,
+        }) + "\n"
+    finally:
+        await response.aclose()
 
 # ── LiteLLM /v1/models -> Ollama /api/tags transformation ──────────────────
 
@@ -462,7 +462,7 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
 
 # ── Error Handling Helper ───────────────────────────────────────────────────
 
-async def handle_litellm_error(response: httpx.Response) -> None:
+def handle_litellm_error(response: httpx.Response) -> None:
     """Raise an HTTPException based on a LiteLLM error response."""
     status_code = response.status_code
     try:
@@ -574,7 +574,6 @@ async def generate(request: GenerateRequest):
             )
             if response.status_code != 200:
                 await handle_litellm_error(response)
-                return  # silence type checker
             return StreamingResponse(
                 stream_generate_transform(client, response, request.model),
                 media_type="text/event-stream",
@@ -586,7 +585,6 @@ async def generate(request: GenerateRequest):
             )
             if response.status_code != 200:
                 await handle_litellm_error(response)
-                return
             data = response.json()
             usage_info = extract_usage_nanos(data.get("usage"))
             choice = data["choices"][0]
@@ -652,7 +650,6 @@ async def chat(request: ChatRequest):
             )
             if response.status_code != 200:
                 await handle_litellm_error(response)
-                return
             return StreamingResponse(
                 stream_chat_transform(client, response, request.model),
                 media_type="text/event-stream",
@@ -664,7 +661,6 @@ async def chat(request: ChatRequest):
             )
             if response.status_code != 200:
                 await handle_litellm_error(response)
-                return
             data = response.json()
             usage_info = extract_usage_nanos(data.get("usage"))
             choice = data["choices"][0]
@@ -706,7 +702,6 @@ async def embed(request: EmbeddingRequest):
         response = await client.post("/v1/embeddings", json=body)
         if response.status_code != 200:
             await handle_litellm_error(response)
-            return EmbeddingResponse(model=request.model, embeddings=[])
         data = response.json()
         embeddings = [item["embedding"] for item in data.get("data", [])]
         usage_info = extract_usage_nanos(data.get("usage"))

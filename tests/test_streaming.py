@@ -33,6 +33,7 @@ def test_generate_streaming(mock_get_client, test_client):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
+    mock_response.aclose = AsyncMock()
 
     async def aiter_lines():
         for line in sse_lines:
@@ -85,6 +86,7 @@ def test_chat_streaming(mock_get_client, test_client):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
+    mock_response.aclose = AsyncMock()
 
     async def aiter_lines():
         for line in sse_lines:
@@ -136,6 +138,7 @@ def test_generate_streaming_no_usage(mock_get_client, test_client):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
+    mock_response.aclose = AsyncMock()
 
     async def aiter_lines():
         for line in sse_lines:
@@ -176,6 +179,7 @@ def test_chat_streaming_with_finish_reason(mock_get_client, test_client):
 
     mock_response = MagicMock()
     mock_response.status_code = 200
+    mock_response.aclose = AsyncMock()
 
     async def aiter_lines():
         for line in lines:
