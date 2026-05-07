@@ -256,7 +256,6 @@ async def stream_generate_transform(
     start_time = time.monotonic()
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
-    final_usage: Optional[Dict[str, Any]] = None
 
     try:
         async for line in response.aiter_lines():
@@ -290,7 +289,6 @@ async def stream_generate_transform(
 
             # Capture usage only once from OpenAI's final chunk
             if "usage" in data:
-                final_usage = data["usage"]
                 prompt_tokens = data["usage"].get("prompt_tokens")
                 completion_tokens = data["usage"].get("completion_tokens")
 
@@ -335,7 +333,6 @@ async def stream_chat_transform(
     start_time = time.monotonic()
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
-    final_usage: Optional[Dict[str, Any]] = None
     finish_reason: Optional[str] = None
 
     try:
@@ -370,7 +367,6 @@ async def stream_chat_transform(
 
             # Capture usage from the authoritative backend response
             if "usage" in data:
-                final_usage = data["usage"]
                 prompt_tokens = data["usage"].get("prompt_tokens")
                 completion_tokens = data["usage"].get("completion_tokens")
 
@@ -482,7 +478,7 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
 
         created_val = m.get("created")
         if created_val is None:
-            created_val = 0
+            created_val = int(time.time())
 
         model_info = ModelInfo(
             name=model_name,
@@ -512,7 +508,7 @@ def handle_litellm_error(response: httpx.Response) -> None:
     try:
         error_data = response.json()
     except Exception as e:
-        logger.debug("Failed to parse LiteLLM error response: %s", e)
+        logger.error("Failed to parse LiteLLM error response: %s", e)
         error_data = {}
 
     detail = error_data.get("error", {})
@@ -631,9 +627,16 @@ async def generate(request: GenerateRequest):
             if response.status_code != 200:
                 await handle_litellm_error(response)
             data = response.json()
+            choices = data.get("choices", [])
+            if not choices:
+                logger.error("LiteLLM returned empty choices for generate request")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Backend returned empty response",
+                )
             usage_info = extract_usage_nanos(data.get("usage"))
-            choice = data["choices"][0]
-            content = choice["message"].get("content", "")
+            choice = choices[0]
+            content = choice.get("message", {}).get("content", "")
             return GenerateResponse(
                 model=request.model,
                 created_at=now_iso(),
@@ -707,9 +710,16 @@ async def chat(request: ChatRequest):
             if response.status_code != 200:
                 await handle_litellm_error(response)
             data = response.json()
+            choices = data.get("choices", [])
+            if not choices:
+                logger.error("LiteLLM returned empty choices for chat request")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Backend returned empty response",
+                )
             usage_info = extract_usage_nanos(data.get("usage"))
-            choice = data["choices"][0]
-            msg = transform_chat_message(choice["message"])
+            choice = choices[0]
+            msg = transform_chat_message(choice.get("message", {}))
             return ChatResponse(
                 model=request.model,
                 created_at=now_iso(),
