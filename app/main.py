@@ -868,6 +868,9 @@ async def _proxy_post(
         raise HTTPException(status_code=504, detail="Backend proxy timeout")
 
     if response.status_code != 200:
+        # For streaming responses, we need to read the body before accessing it
+        if stream:
+            await response.aread()
         await handle_litellm_error(response)
 
     if stream:
