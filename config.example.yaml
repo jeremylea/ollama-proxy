@@ -1,0 +1,58 @@
+models:
+  qwen3-coder:
+    family: qwen2
+    parameter_size: "235B"
+    quantization_level: "FP8"
+    format: "gguf"
+    size: 8589934592
+    context_length: 262144
+    parameters: |
+      num_ctx 262144
+      stop "\n\n"
+    template: |
+      {{ if .System }}<|im_start|>system
+      {{ .System }}
+      <|im_end|>
+      {{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}
+      {{ .Content }}
+      <|im_end|>
+      {{ end }}<|im_start|>assistant
+    model_info:
+      general.architecture: "qwen2"
+      general.parameter_count: 235000000000
+      qwen2.context_length: 262144
+      qwen2.embedding_length: 7168
+      qwen2.attention.head_count: 64
+      qwen2.block_count: 94
+    capabilities:
+      - completion
+      - tools
+
+  qwen36-27b:
+    family: qwen2
+    parameter_size: "27B"
+    quantization_level: "FP8"
+    format: "gguf"
+    size: 28991029248
+    context_length: 262144
+    parameters: |
+      num_ctx 262144
+      stop "\n\n"
+    template: |
+      {{ if .System }}<|im_start|>system
+      {{ .System }}
+      <|im_end|>
+      {{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}
+      {{ .Content }}
+      <|im_end|>
+      {{ end }}<|im_start|>assistant
+    model_info:
+      general.architecture: "qwen2"
+      general.parameter_count: 27000000000
+      qwen2.context_length: 262144
+      qwen2.embedding_length: 5120
+      qwen2.attention.head_count: 48
+      qwen2.block_count: 60
+    capabilities:
+      - completion
+      - tools

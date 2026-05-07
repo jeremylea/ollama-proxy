@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from app.config import settings, setup_logging
+from app.config import settings, setup_logging, MODEL_METADATA
 from app.models import (
     GenerateRequest,
     GenerateResponse,
@@ -412,30 +412,64 @@ async def stream_chat_transform(
     finally:
         await response.aclose()
 
+# ── Model Metadata Helper ───────────────────────────────────────────────────
+
+def get_model_metadata(model_id: str) -> Dict[str, Any]:
+    """Get metadata for a model from config.yaml with sensible defaults."""
+    if model_id in MODEL_METADATA:
+        return MODEL_METADATA[model_id]
+
+    # Infer defaults for unknown models
+    name_lower = model_id.lower()
+    if "gpt" in name_lower:
+        family = "gpt"
+    elif "claude" in name_lower:
+        family = "claude"
+    elif "gemini" in name_lower:
+        family = "gemini"
+    elif "llama" in name_lower:
+        family = "llama"
+    elif "mistral" in name_lower:
+        family = "mistral"
+    elif "qwen" in name_lower:
+        family = "qwen2"
+    else:
+        family = "unknown"
+
+    return {
+        "family": family,
+        "parameter_size": "8B",
+        "quantization_level": "Q4_0",
+        "format": "gguf",
+        "size": 0,
+        "context_length": 2048,
+        "parameters": "",
+        "template": "",
+        "model_info": {},
+        "capabilities": ["completion"],
+    }
+
+
 # ── LiteLLM /v1/models -> Ollama /api/tags transformation ──────────────────
 
 def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
-    """Transform LiteLLM /v1/models response to Ollama /api/tags format."""
+    """Transform LiteLLM /v1/models response to Ollama /api/tags format.
+
+    Only includes models that are present in both the LiteLLM response and
+    config.yaml (MODEL_METADATA). Models from LiteLLM without a config entry
+    are silently dropped.
+    """
     models: List[ModelInfo] = []
     for m in data.get("data", []):
         id_ = m.get("id", "")
-        # Build a deterministic digest from the model id
-        digest = "sha256:" + hashlib.sha256(id_.encode()).hexdigest()
 
-        # Infer family from model name
-        name_lower = id_.lower()
-        if "gpt" in name_lower:
-            family = "gpt"
-        elif "claude" in name_lower:
-            family = "claude"
-        elif "gemini" in name_lower:
-            family = "gemini"
-        elif "llama" in name_lower:
-            family = "llama"
-        elif "mistral" in name_lower:
-            family = "mistral"
-        else:
-            family = "unknown"
+        # Skip models not defined in config.yaml
+        if id_ not in MODEL_METADATA:
+            logger.debug("Skipping LiteLLM model %r (not in config.yaml)", id_)
+            continue
+
+        metadata = MODEL_METADATA[id_]
+        digest = "sha256:" + hashlib.sha256(id_.encode()).hexdigest()
 
         created_val = m.get("created")
         if created_val is None:
@@ -446,14 +480,14 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
             modified_at=datetime.fromtimestamp(
                 created_val, tz=timezone.utc
             ).isoformat(),
-            size=m.get("size", 0) or 0,
+            size=metadata.get("size", 0),
             digest=digest,
             details=ModelDetails(
-                format=m.get("object", "model"),
-                family=family,
-                families=[family],
-                parameter_size=m.get("parameter_size") or "8B",
-                quantization_level=m.get("quantization_level") or "Q4_0",
+                format=metadata.get("format", "gguf"),
+                family=metadata["family"],
+                families=[metadata["family"]],
+                parameter_size=metadata.get("parameter_size", "8B"),
+                quantization_level=metadata.get("quantization_level", "Q4_0"),
             ),
         )
         models.append(model_info)
@@ -720,21 +754,25 @@ async def embed(request: EmbeddingRequest):
 
 @app.post("/api/show", response_model=ShowModelResponse)
 async def show(request: ShowModelRequest):
-    """Show model information (best-effort stub)."""
+    """Show model information with metadata from config.yaml."""
     logger.info("Show request: model=%s", request.model)
-    # We don't have detailed model metadata from LiteLLM, so return a minimal response
-    name = request.model.split(":")[0] if ":" in request.model else request.model
+
+    metadata = get_model_metadata(request.model)
+
     return ShowModelResponse(
         modelfile=f"FROM {request.model}\n",
-        parameters="",
-        template="",
+        parameters=metadata.get("parameters", ""),
+        template=metadata.get("template", ""),
         license="",
         details=ModelDetails(
-            format="api",
-            family=name,
-            families=[name],
+            format=metadata.get("format", "gguf"),
+            family=metadata["family"],
+            families=[metadata["family"]],
+            parameter_size=metadata.get("parameter_size", "8B"),
+            quantization_level=metadata.get("quantization_level", "Q4_0"),
         ),
-        capabilities=["completion"],
+        model_info=metadata.get("model_info", {}),
+        capabilities=metadata.get("capabilities", ["completion"]),
     )
 
 

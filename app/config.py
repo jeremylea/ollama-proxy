@@ -2,12 +2,19 @@
 Configuration for the Ollama API proxy.
 
 All settings are loaded from environment variables or a .env file.
+Model metadata is loaded from config.yaml at startup.
 """
 
 import os
+import logging
+from typing import Any, Dict
+
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class Settings:
@@ -29,15 +36,51 @@ class Settings:
     VERSION: str = "0.6.4"
 
 
-settings = Settings()
+settings = Settings
+
+# Model metadata loaded from config.yaml
+MODEL_METADATA: Dict[str, Any] = {}
+
+
+def load_model_metadata() -> None:
+    """Load model metadata from config.yaml (or config.example.yaml as fallback)."""
+    global MODEL_METADATA
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    config_path = os.path.join(base_dir, "config.yaml")
+    example_path = os.path.join(base_dir, "config.example.yaml")
+
+    # Use config.yaml if it exists, otherwise fall back to config.example.yaml
+    if not os.path.exists(config_path):
+        if os.path.exists(example_path):
+            config_path = example_path
+            logger.info("Using config.example.yaml as config.yaml not found")
+        else:
+            logger.warning(
+                "Neither config.yaml nor config.example.yaml found in %s", base_dir
+            )
+            MODEL_METADATA = {}
+            return
+
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        MODEL_METADATA = config.get("models", {}) if config else {}
+        logger.info(
+            "Loaded metadata for %d models from %s",
+            len(MODEL_METADATA),
+            os.path.basename(config_path),
+        )
+    except Exception as e:
+        logger.error("Failed to load %s: %s", os.path.basename(config_path), e)
+        MODEL_METADATA = {}
 
 
 def setup_logging() -> None:
     """Configure application-wide logging."""
-    import logging
-
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # Load model metadata after logging is configured
+    load_model_metadata()

@@ -9,6 +9,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 @patch("app.main.get_http_client")
 def test_tags_endpoint(mock_get_client, test_client):
     """Test /api/tags fetches and transforms models from LiteLLM."""
+    import app.main
+    original = app.main.MODEL_METADATA.copy()
+    app.main.MODEL_METADATA.clear()
+    app.main.MODEL_METADATA.update({
+        "gpt-4o": {"family": "gpt", "format": "gguf", "size": 1000,
+                    "parameter_size": "1.8B", "quantization_level": "Q4_0"},
+        "claude-3-5-sonnet-20241022": {"family": "claude", "format": "gguf", "size": 2000,
+                    "parameter_size": "15B", "quantization_level": "Q4_0"},
+    })
+    try:
+        _test_tags_endpoint_impl(mock_get_client, test_client)
+    finally:
+        app.main.MODEL_METADATA.clear()
+        app.main.MODEL_METADATA.update(original)
+
+
+def _test_tags_endpoint_impl(mock_get_client, test_client):
     mock_client = AsyncMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
@@ -86,7 +103,30 @@ def test_tags_litellm_error(mock_get_client, test_client):
 
 @patch("app.main.get_http_client")
 def test_tags_model_families(mock_get_client, test_client):
-    """Test that model families are correctly inferred."""
+    """Test that model families come from config.yaml metadata."""
+    import app.main
+    original = app.main.MODEL_METADATA.copy()
+    app.main.MODEL_METADATA.clear()
+    app.main.MODEL_METADATA.update({
+        "gpt-4o": {"family": "gpt", "format": "gguf", "size": 0,
+                    "parameter_size": "1.8B", "quantization_level": "Q4_0"},
+        "claude-3-opus": {"family": "claude", "format": "gguf", "size": 0,
+                    "parameter_size": "20B", "quantization_level": "Q4_0"},
+        "gemini-pro": {"family": "gemini", "format": "gguf", "size": 0,
+                    "parameter_size": "10B", "quantization_level": "Q4_0"},
+        "llama3.1": {"family": "llama", "format": "gguf", "size": 0,
+                    "parameter_size": "8B", "quantization_level": "Q4_0"},
+        "mistral-large": {"family": "mistral", "format": "gguf", "size": 0,
+                    "parameter_size": "12B", "quantization_level": "Q4_0"},
+    })
+    try:
+        _test_tags_model_families_impl(mock_get_client, test_client)
+    finally:
+        app.main.MODEL_METADATA.clear()
+        app.main.MODEL_METADATA.update(original)
+
+
+def _test_tags_model_families_impl(mock_get_client, test_client):
     mock_client = AsyncMock()
     mock_response = MagicMock()
     mock_response.status_code = 200
@@ -107,10 +147,12 @@ def test_tags_model_families(mock_get_client, test_client):
     assert response.status_code == 200
     data = response.json()
 
+    # "some-unknown-model" is not in config, so it should be filtered out
+    assert len(data["models"]) == 5
+
     families = {m["name"]: m["details"]["family"] for m in data["models"]}
     assert families["gpt-4o"] == "gpt"
     assert families["claude-3-opus"] == "claude"
     assert families["gemini-pro"] == "gemini"
     assert families["llama3.1"] == "llama"
     assert families["mistral-large"] == "mistral"
-    assert families["some-unknown-model"] == "unknown"
