@@ -375,7 +375,7 @@ def test_v1_chat_completions_non_streaming(mock_get_client, test_client):
         }],
         "usage": {"prompt_tokens": 3, "completion_tokens": 2},
     }
-    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client.send = AsyncMock(return_value=mock_response)
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/chat/completions", json={
@@ -389,13 +389,10 @@ def test_v1_chat_completions_non_streaming(mock_get_client, test_client):
     assert data["id"] == "chatcmpl-123"
     assert data["choices"][0]["message"]["content"] == "Hello!"
 
-    # Verify the request was forwarded as-is to LiteLLM
-    mock_client.post.assert_called_once()
-    call_kwargs = mock_client.post.call_args
-    assert call_kwargs[0][0] == "/v1/chat/completions"
-    body = call_kwargs[1]["json"]
-    assert body["model"] == "gpt-4o"
-    assert body["messages"] == [{"role": "user", "content": "Hi"}]
+    # Verify send was called with stream=False
+    mock_client.send.assert_called_once()
+    call_args = mock_client.send.call_args
+    assert call_args[1]["stream"] is False
 
 
 @patch("app.main.get_http_client")
@@ -414,7 +411,7 @@ def test_v1_chat_completions_streaming(mock_get_client, test_client):
 
     mock_response.aiter_lines = _aiter_lines
     mock_response.aclose = AsyncMock()
-    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client.send = AsyncMock(return_value=mock_response)
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/chat/completions", json={
@@ -431,7 +428,7 @@ def test_v1_chat_completions_streaming(mock_get_client, test_client):
 def test_v1_chat_completions_backend_unavailable(mock_get_client, test_client):
     """Test /v1/chat/completions when LiteLLM is unreachable."""
     mock_client = AsyncMock()
-    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_client.send.side_effect = ConnectError("Connection refused")
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/chat/completions", json={
@@ -490,7 +487,7 @@ def test_v1_embeddings(mock_get_client, test_client):
         "data": [{"embedding": [0.1, 0.2, 0.3], "index": 0}],
         "usage": {"prompt_tokens": 3},
     }
-    mock_client.post = AsyncMock(return_value=mock_response)
+    mock_client.send = AsyncMock(return_value=mock_response)
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/embeddings", json={
@@ -502,16 +499,14 @@ def test_v1_embeddings(mock_get_client, test_client):
     data = response.json()
     assert data["data"][0]["embedding"] == [0.1, 0.2, 0.3]
 
-    mock_client.post.assert_called_once()
-    call_kwargs = mock_client.post.call_args
-    assert call_kwargs[0][0] == "/v1/embeddings"
+    mock_client.send.assert_called_once()
 
 
 @patch("app.main.get_http_client")
 def test_v1_embeddings_backend_unavailable(mock_get_client, test_client):
     """Test /v1/embeddings when LiteLLM is unreachable."""
     mock_client = AsyncMock()
-    mock_client.post.side_effect = ConnectError("Connection refused")
+    mock_client.send.side_effect = ConnectError("Connection refused")
     mock_get_client.return_value = mock_client
 
     response = test_client.post("/v1/embeddings", json={

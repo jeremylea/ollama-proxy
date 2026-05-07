@@ -857,8 +857,9 @@ async def _proxy_post(
 ) -> Union[StreamingResponse, JSONResponse]:
     """Generic helper that POSTs to LiteLLM and returns the response."""
     client = await get_http_client()
+    request = client.build_request("POST", path, json=body)
     try:
-        response = await client.post(path, json=body, stream=stream)
+        response = await client.send(request, stream=stream)
     except httpx.ConnectError as e:
         logger.error("Cannot connect to LiteLLM proxy: %s", e)
         raise HTTPException(status_code=502, detail="Backend proxy unavailable")
