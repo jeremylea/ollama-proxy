@@ -461,7 +461,7 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
     Only includes models that are present in both the LiteLLM response and
     config.yaml (MODEL_METADATA). Models from LiteLLM without a config entry
     are silently dropped.
-    
+
     Each model name includes the ':latest' tag suffix to match Ollama's
     naming convention (e.g. 'llama3.2:latest').
     """
@@ -475,7 +475,7 @@ def transform_litellm_models(data: Dict[str, Any]) -> ListTagsResponse:
             continue
 
         metadata = MODEL_METADATA[id_]
-        
+
         # Ollama uses model:tag format, where tag defaults to 'latest'
         model_name = f"{id_}:latest"
         digest = "sha256:" + hashlib.sha256(model_name.encode()).hexdigest()
@@ -602,7 +602,7 @@ async def generate(request: GenerateRequest):
     fmt = build_openai_format(request.format)
 
     body: Dict[str, Any] = {
-        "model": request.model,
+        "model": _strip_model_tag(request.model),  # Strip tag for LiteLLM
         "messages": messages,
         **openai_params,
     }
@@ -676,7 +676,7 @@ async def chat(request: ChatRequest):
     fmt = build_openai_format(request.format)
 
     body: Dict[str, Any] = {
-        "model": request.model,
+        "model": _strip_model_tag(request.model),  # Strip tag for LiteLLM
         "messages": messages,
         **openai_params,
     }
@@ -736,7 +736,7 @@ async def embed(request: EmbeddingRequest):
     )
 
     body: Dict[str, Any] = {
-        "model": request.model,
+        "model": _strip_model_tag(request.model),  # Strip tag for LiteLLM
         "input": input_list,
     }
     if request.truncate is not None:
