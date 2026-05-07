@@ -247,7 +247,7 @@ async def stream_generate_transform(
     http_client: httpx.AsyncClient,
     response: httpx.Response,
     model: str,
-) -> AsyncGenerator[str]:
+) -> AsyncGenerator[str, None]:
     """Transform OpenAI SSE stream into Ollama generate SSE format."""
     created_at = now_iso()
     start_time = time.monotonic()
@@ -326,7 +326,7 @@ async def stream_chat_transform(
     http_client: httpx.AsyncClient,
     response: httpx.Response,
     model: str,
-) -> AsyncGenerator[str]:
+) -> AsyncGenerator[str, None]:
     """Transform OpenAI SSE stream into Ollama chat SSE format."""
     created_at = now_iso()
     start_time = time.monotonic()
