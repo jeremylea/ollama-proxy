@@ -57,7 +57,7 @@ class EmbeddingRequest(BaseModel):
 
 class ShowModelRequest(BaseModel):
     """Request model for POST /api/show"""
-    model: str
+    model: str = ""
     verbose: Optional[bool] = False
 
 

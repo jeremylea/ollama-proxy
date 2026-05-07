@@ -47,6 +47,26 @@ def test_show_endpoint(test_client):
     assert "modelfile" in data
 
 
+def test_show_endpoint_empty_json_body(test_client):
+    """Test the POST /api/show endpoint with an empty JSON body (Copilot sends this)."""
+    response = test_client.post(
+        "/api/show",
+        content=b"{}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "modelfile" in data
+
+
+def test_show_endpoint_no_model_field(test_client):
+    """Test the POST /api/show endpoint when model field is missing."""
+    response = test_client.post("/api/show", json={})
+    assert response.status_code == 200
+    data = response.json()
+    assert "modelfile" in data
+
+
 @pytest.mark.parametrize("endpoint,method,body", [
     ("/api/create", "post", {"model": "test"}),
     ("/api/copy", "post", {"source": "src", "destination": "dst"}),
